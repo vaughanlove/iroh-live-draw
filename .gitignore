@@ -1,0 +1,17 @@
+# secrets / local env
+.env
+.env.*
+
+# rust
+target/
+crates/*/target/
+
+# node
+node_modules/
+web/node_modules/
+
+# build output (rebuilt by Pages CI)
+web/dist/
+
+# wrangler / tooling caches
+.wrangler/

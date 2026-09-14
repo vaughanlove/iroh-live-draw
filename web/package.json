@@ -1,0 +1,1 @@
+{"name":"iroh-live-draw-web","private":true,"type":"module","scripts":{"dev":"vite","build":"vite build"},"dependencies":{"react":"18","react-dom":"18","tldraw":"3"},"devDependencies":{"vite":"5","@vitejs/plugin-react":"4"}}
