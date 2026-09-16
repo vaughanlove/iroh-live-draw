@@ -35,6 +35,16 @@ export default function App() {
   const [peer, setPeer] = useState('')
   const [status, setStatus] = useState('starting…')
   const [showAdd, setShowAdd] = useState(false)
+  const [showDbg, setShowDbg] = useState(false)
+  const [dbg, setDbg] = useState('')
+  // event stats: per-type counters + rolling throughput
+  const stats = useRef({ sent: {} as Record<string, number>, recv: {} as Record<string, number>, stale: 0 })
+  const times = useRef<number[]>([])
+  const bump = (dir: 'sent' | 'recv', t: string) => {
+    const s = stats.current
+    s[dir][t] = (s[dir][t] ?? 0) + 1
+    times.current.push(Date.now())
+  }
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
   const remote = useRef(false)
   const timers = useRef<number[]>([])
@@ -51,6 +61,7 @@ export default function App() {
   const lastPtr = useRef(0)
 
   const sendMsg = (obj: any) => {
+    bump('sent', obj?.t ?? '?')
     const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
     if (inRoom.current) roomPush(s)
     else irohPush(s)
@@ -69,16 +80,17 @@ export default function App() {
   handleRef.current = (msg: string) => {
     try {
       const m = JSON.parse(msg)
+      bump('recv', m?.t ?? (Array.isArray(m) ? 'legacy' : '?'))
       if (m?.t === 'cursor' && m.from && m.from !== me.current) {
         cursors.current[m.from] = { x: m.x, y: m.y, at: Date.now() }
         pushCollaborators()
         return
       }
       if (m?.t === 'p') {
-        if (typeof m.seq === 'number' && m.from) {
-          if (m.seq <= (lastSeq.current[m.from] ?? -1)) return
-          lastSeq.current[m.from] = m.seq
-        }
+          if (typeof m.seq === 'number' && m.from) {
+            if (m.seq <= (lastSeq.current[m.from] ?? -1)) { stats.current.stale++; return }
+            lastSeq.current[m.from] = m.seq
+          }
         latestScene.current = m.elements
       } else if (m?.t === 'snap-req') {
         sendMsg({ t: 'snap', elements: apiRef.current?.getSceneElements() ?? [] })
@@ -101,6 +113,19 @@ export default function App() {
     }
   }
 
+  // debug drawer data (rendered only when open)
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      const now = Date.now()
+      times.current = times.current.filter((ts) => now - ts < 2000)
+      const s = stats.current
+      const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
+      setDbg(
+        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\nroom: ${inRoom.current} dialed: ${dialed.current.size} me: ${me.current.slice(0, 8)}`,
+      )
+    }, 500)
+    return () => clearInterval(t)
+  }, [])
   // apply newest queued scene at most once per frame (bounded work)
   useEffect(() => {
     let raf = 0
@@ -263,6 +288,10 @@ export default function App() {
           }}>SVG</button>
         </div>
         <div style={{ opacity: 0.6, marginTop: 4, fontSize: 12 }}>{status}</div>
+        <button style={btn} onClick={() => setShowDbg((s) => !s)}>debug</button>
+        {showDbg && (
+          <pre style={{ fontSize: 10, fontFamily: 'monospace', background: '#0d0f16', color: '#9fe', borderRadius: 8, padding: 8, marginTop: 4, whiteSpace: 'pre-wrap' }}>{dbg}</pre>
+        )}
       </div>
     </div>
   )
