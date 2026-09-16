@@ -107,6 +107,7 @@ export default function App() {
     remote.current = true
     try {
       a.updateScene({ elements: reconcileElements(a.getSceneElements(), elements, a.getAppState()) as OrderedExcalidrawElement[] })
+      for (const el of a.getSceneElements()) sentVersions.current[el.id] = el.version
     } finally {
       remote.current = false
     }
@@ -205,10 +206,15 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // local edits -> broadcast every animation frame (~60/s)
+  // local edits -> broadcast only version-bumped elements (~60/s).
+  // Keeps every message far under gossip's size cap.
+  const sentVersions = useRef<Record<string, number>>({})
   const onChange = (elements: readonly OrderedExcalidrawElement[]) => {
     if (remote.current || !me.current) return
-    sendMsg({ t: 'p', elements })
+    const changed = elements.filter((el: any) => sentVersions.current[el.id] !== el.version)
+    if (!changed.length) return
+    for (const el of changed as any[]) sentVersions.current[el.id] = el.version
+    sendMsg({ t: 'p', elements: changed })
   }
 
   const onPointerUpdate = (payload: { pointer: { x: number; y: number } }) => {

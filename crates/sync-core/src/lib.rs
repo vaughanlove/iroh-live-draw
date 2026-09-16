@@ -53,6 +53,9 @@ impl Sync {
             .await
             .map_err(|e| e.to_string())?;
         let gossip = Gossip::builder()
+            // gossip caps messages at 4KB by default — busy strokes and
+            // snapshots need headroom (oversize sends fail silently)
+            .max_message_size(1024 * 256)
             .spawn(ep.clone())
             .await
             .map_err(|e| e.to_string())?;
