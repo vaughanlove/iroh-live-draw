@@ -2,6 +2,45 @@ import { useEffect, useRef, useState } from 'react'
 import { Tldraw, useEditor, getSnapshot } from 'tldraw'
 import { irohInit, irohJoin, irohPush, roomTopic, roomJoin, roomPush } from './iroh'
 
+// Packet pipeline: encode (compact) -> transport -> decode (expand) ->
+// order (seq) -> apply (coalesce). Every message stays self-contained, so
+// any loss/reorder degrades to a dropped frame, never corruption.
+const r2 = (v: any) => (typeof v === 'number' ? Math.round(v * 100) / 100 : v)
+// draw/highlight points [{x,y,z}...] -> flat [x,y,z...]: ~3x smaller JSON
+const compactRec = (r: any) => {
+  const segs = r?.props?.segments
+  if (!Array.isArray(segs)) return r
+  return {
+    ...r,
+    props: {
+      ...r.props,
+      segments: segs.map((s: any) => ({
+        ...s,
+        points:
+          Array.isArray(s.points) && s.points.length && typeof s.points[0] === 'object'
+            ? s.points.flatMap((p: any) => [r2(p.x), r2(p.y), r2(p.z)])
+            : s.points,
+      })),
+    },
+  }
+}
+const expandRec = (r: any) => {
+  const segs = r?.props?.segments
+  if (!Array.isArray(segs)) return r
+  const out = []
+  for (const s of segs) {
+    let points = s.points
+    if (Array.isArray(points) && typeof points[0] === 'number') {
+      const pts = []
+      for (let i = 0; i + 2 < points.length; i += 3)
+        pts.push({ x: points[i], y: points[i + 1], z: points[i + 2] })
+      points = pts
+    }
+    out.push({ ...s, points })
+  }
+  return { ...r, props: { ...r.props, segments: out } }
+}
+
 // navigator.clipboard needs HTTPS; plain-HTTP LAN (Android especially)
 // throws, so fall back to the legacy execCommand path.
 async function copyText(t: string) {
@@ -120,20 +159,33 @@ function Net() {
       reg(); poll()
       timers.current.push(window.setInterval(reg, 20000), window.setInterval(poll, 5000))
     }).catch((e) => setStatus(`init failed: ${e}`))
-    // realtime: forward every local document change, coalesced per frame
+    // realtime: forward every local document change, coalesced per frame,
+    // compacted, paced to ~30/s
+    let lastFlush = 0
+    const flush = () => {
+      raf.current = 0
+      if (Date.now() - lastFlush < 33) {
+        if (pending.current) raf.current = requestAnimationFrame(flush)
+        return
+      }
+      lastFlush = Date.now()
+      const d = pending.current; pending.current = null
+      if (d && (d.added.length || d.updated.size || d.removed.length)) {
+        sendMsg({
+          t: 'p',
+          added: d.added.map(compactRec),
+          updated: [...d.updated.values()].map(compactRec),
+          removed: d.removed,
+        })
+      }
+    }
     const off = editor.store.listen((entry) => {
       if (entry.source !== 'user') return
       const p = (pending.current ??= { added: [], updated: new Map(), removed: [] })
       for (const r of Object.values(entry.changes.added)) p.added.push(r)
       for (const [id, change] of Object.entries(entry.changes.updated)) p.updated.set(id, (change as any)[1])
       for (const id of Object.keys(entry.changes.removed)) p.removed.push(id as string)
-      if (!raf.current) raf.current = requestAnimationFrame(() => {
-        raf.current = 0
-        const d = pending.current; pending.current = null
-        if (d && (d.added.length || d.updated.size || d.removed.length)) {
-          sendMsg({ t: 'p', added: d.added, updated: [...d.updated.values()], removed: d.removed })
-        }
-      })
+      if (!raf.current) raf.current = requestAnimationFrame(flush)
     }, { scope: 'document' })
     timers.current.push(window.setInterval(() => setTick((t) => t + 1), 500)) // prune stale lasers
     // smoothing loop: laser dots ease toward targets; at most one queued
@@ -152,8 +204,8 @@ function Net() {
         moved = true
         editor.store.mergeRemoteChanges(() => {
           if (m.removed?.length) editor.store.remove(m.removed)
-          if (m.added?.length) editor.store.put(m.added)
-          if (m.updated?.length) editor.store.put(m.updated)
+          if (m.added?.length) editor.store.put(m.added.map(expandRec))
+          if (m.updated?.length) editor.store.put(m.updated.map(expandRec))
         })
       }
       if (moved) setTick((t) => t + 1)
