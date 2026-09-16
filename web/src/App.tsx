@@ -132,9 +132,9 @@ function Net() {
         } else if (m?.t === 'snap') {
           mergeSnap(m.snapshot)
           // answer so the joiner also gets our records — both sides converge
-          // sendMsg({ t: 'snap-back', snapshot: getSnapshot(editor.store) })
+          sendMsg({ t: 'snap-back', snapshot: getSnapshot(editor.store) })
         } else if (m?.t === 'snap-back') {
-           // mergeSnap(m.snapshot)
+          mergeSnap(m.snapshot)
         } else mergeSnap(m) // legacy untagged full snapshot
       } catch {}
     }).then(async (a) => {
