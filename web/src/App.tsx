@@ -95,21 +95,14 @@ function Net() {
   const connect = async (addr: string) => {
     setStatus('connecting…')
     try {
-      await irohJoin(addr, JSON.stringify({ from: me.current, seq: seq.current++, t: 'snap', snapshot: getSnapshot(editor.store) }))
+      await irohJoin(addr, JSON.stringify({ from: me.current, seq: seq.current++, t: 'snap-req' }))
       setStatus('connected — draw!')
     } catch (e) { setStatus(`connect failed: ${e}`) }
   }
 
   useEffect(() => {
-    // Union-merge a full snapshot's records — never overwrites either side.
-    const mergeSnap = (snap: any) => {
-      // tldraw >=3 shape: {document: {store, schema}, session}; accept legacy {store} too
-      const recs = Object.values(snap?.document?.store ?? snap?.store ?? {}) as any[]
-      if (!recs.length) return
-      try {
-        editor.store.mergeRemoteChanges(() => { editor.store.put(recs) })
-      } catch {}
-    }
+    // Board-as-is: newcomer takes the board exactly. No merges, no replies
+    // except answering a state request with the current snapshot.
     irohInit((msg) => {
       try {
         const m = JSON.parse(msg)
@@ -129,13 +122,19 @@ function Net() {
             lastSeq.current[m.from] = m.seq
           }
           latestPatch.current[m.from ?? '?'] = m
-        } else if (m?.t === 'snap') {
-          mergeSnap(m.snapshot)
-          // answer so the joiner also gets our records — both sides converge
-          sendMsg({ t: 'snap-back', snapshot: getSnapshot(editor.store) })
-        } else if (m?.t === 'snap-back') {
-          mergeSnap(m.snapshot)
-        } else mergeSnap(m) // legacy untagged full snapshot
+        } else if (m?.t === 'snap-req') {
+          sendMsg({ t: 'snap', snapshot: getSnapshot(editor.store) })
+        } else if (m?.t === 'snap' || m?.t === 'snap-back') {
+          const doc = m.snapshot?.document ?? m.snapshot
+          if (doc) {
+            try { editor.store.loadStoreSnapshot(doc) } catch {}
+            setStatus('board loaded')
+            setTimeout(() => setStatus('ready'), 2000)
+          }
+        } else if (m && !m.t) {
+          const doc = m?.document ?? m
+          try { editor.store.loadStoreSnapshot(doc) } catch {}
+        }
       } catch {}
     }).then(async (a) => {
       setId(a)
@@ -274,9 +273,8 @@ function Net() {
             } catch (e) { setStatus(`share failed: ${e}`) }
           }}>⧉ share</button>
           <button style={btn} onClick={() => {
-            sendMsg({ t: 'snap', snapshot: getSnapshot(editor.store) })
-            setStatus('synced')
-            setTimeout(() => setStatus('ready'), 2000)
+            sendMsg({ t: 'snap-req' })
+            setStatus('reloading board…')
           }}>⟳ sync</button>
           <button style={btn} onClick={() => copyText(JSON.stringify(getSnapshot(editor.store))).then(() => alert('Copied JSON — paste into any agent'))}>agent JSON</button>
           <button style={btn} onClick={async () => {
