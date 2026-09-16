@@ -41,3 +41,8 @@ export function roomPush(s: string) {
   if (!sync) return
   try { sync.room_push(s) } catch {}
 }
+
+export function signPresence(msg: string): string {
+  if (!sync) throw new Error('init first')
+  return sync.sign_presence(msg)
+}

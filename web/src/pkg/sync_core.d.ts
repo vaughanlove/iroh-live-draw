@@ -82,6 +82,12 @@ export class Sync {
      * this device's identity (same node id / addr across reloads).
      */
     secret_key(): string;
+    /**
+     * Sign a message with this device's identity key (hex Ed25519 signature).
+     * Used for presence: the worker verifies it against our node id, so no
+     * password is ever needed or stored.
+     */
+    sign_presence(msg: string): string;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -111,14 +117,15 @@ export interface InitOutput {
     readonly sync_room_push: (a: number, b: number, c: number) => void;
     readonly sync_room_topic: () => [number, number, number, number];
     readonly sync_secret_key: (a: number) => [number, number];
+    readonly sync_sign_presence: (a: number, b: number, c: number) => [number, number];
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h1be5897824ed5003: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7c8754fb4fccc717: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h9288e816a40a14d3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_23: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_24: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_25: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_26: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h5ab1ec89429495ee: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__hc3b0e800b5c166fa: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__hfff20b4885a17646: (a: number, b: number) => void;

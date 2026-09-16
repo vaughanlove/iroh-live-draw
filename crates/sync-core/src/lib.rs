@@ -121,6 +121,13 @@ impl Sync {
         self.ep.secret_key().to_string()
     }
 
+    /// Sign a message with this device's identity key (hex Ed25519 signature).
+    /// Used for presence: the worker verifies it against our node id, so no
+    /// password is ever needed or stored.
+    pub fn sign_presence(&self, msg: &str) -> String {
+        hex::encode(self.ep.secret_key().sign(msg.as_bytes()).to_bytes())
+    }
+
     /// Full dial string: "<node-id> <home-relay-url>". Waits for home relay.
     pub async fn addr(&self) -> Result<String, JsValue> {
         let relay = self
