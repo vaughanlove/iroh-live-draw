@@ -36,7 +36,7 @@ function Net() {
   const curs = useRef<Record<string, Cursor>>({})
   const [, setTick] = useState(0)
   const [showAdd, setShowAdd] = useState(false)
-  const pending = useRef<{ added: any[]; updated: any[]; removed: string[] } | null>(null)
+  const pending = useRef<{ added: any[]; updated: Map<string, any>; removed: string[] } | null>(null)
   const raf = useRef(0)
   const timers = useRef<number[]>([])
 
@@ -46,6 +46,9 @@ function Net() {
   const seq = useRef(0)
   const inRoom = useRef(false) // live traffic rides gossip once joined
   const lastSeq = useRef<Record<string, number>>({})
+  // receive coalescing: keep only the newest patch per sender; the render
+  // loop applies at most one per frame, so a burst can never backlog the UI
+  const latestPatch = useRef<Record<string, any>>({})
   const sendMsg = (obj: any) => {
     const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
     if (inRoom.current) roomPush(s)
@@ -87,12 +90,7 @@ function Net() {
             if (m.seq <= (lastSeq.current[m.from] ?? -1)) return // stale copy
             lastSeq.current[m.from] = m.seq
           }
-          // live patch: apply remote records, no history/echo
-          editor.store.mergeRemoteChanges(() => {
-            if (m.removed?.length) editor.store.remove(m.removed)
-            if (m.added?.length) editor.store.put(m.added)
-            if (m.updated?.length) editor.store.put(m.updated)
-          })
+          latestPatch.current[m.from ?? '?'] = m
         } else if (m?.t === 'snap') {
           mergeSnap(m.snapshot)
           // answer so the joiner also gets our records — both sides converge
@@ -125,20 +123,21 @@ function Net() {
     // realtime: forward every local document change, coalesced per frame
     const off = editor.store.listen((entry) => {
       if (entry.source !== 'user') return
-      const p = (pending.current ??= { added: [], updated: [], removed: [] })
+      const p = (pending.current ??= { added: [], updated: new Map(), removed: [] })
       for (const r of Object.values(entry.changes.added)) p.added.push(r)
-      for (const [, to] of Object.values(entry.changes.updated)) p.updated.push(to)
+      for (const [id, change] of Object.entries(entry.changes.updated)) p.updated.set(id, (change as any)[1])
       for (const id of Object.keys(entry.changes.removed)) p.removed.push(id as string)
       if (!raf.current) raf.current = requestAnimationFrame(() => {
         raf.current = 0
         const d = pending.current; pending.current = null
-        if (d && (d.added.length || d.updated.length || d.removed.length)) {
-          sendMsg({ t: 'p', ...d })
+        if (d && (d.added.length || d.updated.size || d.removed.length)) {
+          sendMsg({ t: 'p', added: d.added, updated: [...d.updated.values()], removed: d.removed })
         }
       })
     }, { scope: 'document' })
     timers.current.push(window.setInterval(() => setTick((t) => t + 1), 500)) // prune stale lasers
-    // smoothing loop: displayed dots ease toward latest targets (~60fps)
+    // smoothing loop: laser dots ease toward targets; at most one queued
+    // patch per sender is applied per frame (~60fps, bounded work)
     let raf2 = 0
     const step = () => {
       raf2 = requestAnimationFrame(step)
@@ -147,6 +146,15 @@ function Net() {
         if (Date.now() - c.at > 3000) { delete curs.current[from]; moved = true; continue }
         const nx = c.x + (c.tx - c.x) * 0.25, ny = c.y + (c.ty - c.y) * 0.25
         if (Math.abs(nx - c.x) + Math.abs(ny - c.y) > 0.05) { c.x = nx; c.y = ny; moved = true }
+      }
+      const pend = latestPatch.current; latestPatch.current = {}
+      for (const m of Object.values(pend)) {
+        moved = true
+        editor.store.mergeRemoteChanges(() => {
+          if (m.removed?.length) editor.store.remove(m.removed)
+          if (m.added?.length) editor.store.put(m.added)
+          if (m.updated?.length) editor.store.put(m.updated)
+        })
       }
       if (moved) setTick((t) => t + 1)
     }
