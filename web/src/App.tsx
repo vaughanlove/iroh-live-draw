@@ -55,9 +55,7 @@ export default function App() {
   // fixed dev room: presence-discovered peers converge here without links
   const DEV_TOPIC = 'fc0e92f0414e9f0cc1445177fec17336a2ca07396ae16334d1029f31540663e4'
   const lastSeq = useRef<Record<string, number>>({})
-  const latestScene = useRef<any[] | null>(null)
   const cursors = useRef<Record<string, PeerCursor>>({})
-  const lastFlush = useRef(0)
   const lastPtr = useRef(0)
 
   const sendMsg = (obj: any) => {
@@ -86,13 +84,14 @@ export default function App() {
         pushCollaborators()
         return
       }
-      if (m?.t === 'p') {
+        if (m?.t === 'p') {
           if (typeof m.seq === 'number' && m.from) {
             if (m.seq <= (lastSeq.current[m.from] ?? -1)) { stats.current.stale++; return }
             lastSeq.current[m.from] = m.seq
           }
-        latestScene.current = m.elements
-      } else if (m?.t === 'snap-req') {
+          // apply immediately (no queue): keeps latency at one frame
+          if (Array.isArray(m.elements)) applyRemote(m.elements)
+        } else if (m?.t === 'snap-req') {
         sendMsg({ t: 'snap', elements: apiRef.current?.getSceneElements() ?? [] })
       } else if (m?.t === 'snap' || m?.t === 'snap-back') {
         if (Array.isArray(m.elements)) applyRemote(m.elements)
@@ -126,19 +125,6 @@ export default function App() {
     }, 500)
     return () => clearInterval(t)
   }, [])
-  // apply newest queued scene at most once per frame (bounded work)
-  useEffect(() => {
-    let raf = 0
-    const step = () => {
-      raf = requestAnimationFrame(step)
-      const el = latestScene.current
-      latestScene.current = null
-      if (el) applyRemote(el)
-    }
-    raf = requestAnimationFrame(step)
-    return () => cancelAnimationFrame(raf)
-  }, [])
-
   // prune stale cursors
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -183,16 +169,17 @@ export default function App() {
       }
       if (viaLink && viaLink !== a) connect(viaLink)
       // dev presence: signed register, then auto-dial every new peer seen.
-      // No-op where /api/presence doesn't exist (local static server).
+      // Skipped entirely where /api/presence doesn't answer (local server).
       const presence = async () => {
         try {
           const ts = Date.now()
           const msg = `${me.current}.${a}.${ts}`
-          await fetch('/api/presence', {
+          const reg = await fetch('/api/presence', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ nodeId: me.current, addr: a, ts, sig: signPresence(msg) }),
           })
+          if (!reg.ok) return false
           const peers: { nodeId: string; addr: string }[] = await (await fetch('/api/presence')).json()
           const fresh = peers.filter((p) => p?.nodeId && p.nodeId !== me.current && p.addr && !dialed.current.has(p.nodeId))
           if (fresh.length) {
@@ -205,21 +192,19 @@ export default function App() {
               connect(p.addr)
             }
           }
+          return true
         } catch {}
+        return false
       }
-      presence()
-      timers.current.push(window.setInterval(presence, 20000))
+      if (await presence()) timers.current.push(window.setInterval(presence, 20000))
     }).catch((e) => setStatus(`init failed: ${e}`))
     return () => timers.current.forEach(clearInterval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // local edits -> broadcast (~30/s, latest scene only)
+  // local edits -> broadcast every animation frame (~60/s)
   const onChange = (elements: readonly OrderedExcalidrawElement[]) => {
     if (remote.current || !me.current) return
-    const now = Date.now()
-    if (now - lastFlush.current < 33) return
-    lastFlush.current = now
     sendMsg({ t: 'p', elements })
   }
 
