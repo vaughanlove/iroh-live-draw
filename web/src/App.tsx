@@ -71,7 +71,6 @@ function Net() {
   const [id, setId] = useState('')
   const [peer, setPeer] = useState('')
   const [status, setStatus] = useState('starting…')
-  const [peers, setPeers] = useState<string[]>([])
   const curs = useRef<Record<string, Cursor>>({})
   const [, setTick] = useState(0)
   const [showAdd, setShowAdd] = useState(false)
@@ -133,9 +132,9 @@ function Net() {
         } else if (m?.t === 'snap') {
           mergeSnap(m.snapshot)
           // answer so the joiner also gets our records — both sides converge
-          sendMsg({ t: 'snap-back', snapshot: getSnapshot(editor.store) })
+          // sendMsg({ t: 'snap-back', snapshot: getSnapshot(editor.store) })
         } else if (m?.t === 'snap-back') {
-          mergeSnap(m.snapshot)
+           // mergeSnap(m.snapshot)
         } else mergeSnap(m) // legacy untagged full snapshot
       } catch {}
     }).then(async (a) => {
@@ -153,11 +152,6 @@ function Net() {
         } catch (e) { setStatus(`room failed: ${e}`) }
       }
       if (viaLink && viaLink !== a) connect(viaLink)
-      // lobby: register + refresh peer list (server prunes stale entries)
-      const reg = () => fetch('/api/peers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ addr: a }) }).catch(() => {})
-      const poll = () => fetch('/api/peers').then((r) => r.json()).then((l: string[]) => setPeers(l.filter((x) => x !== a))).catch(() => {})
-      reg(); poll()
-      timers.current.push(window.setInterval(reg, 20000), window.setInterval(poll, 5000))
     }).catch((e) => setStatus(`init failed: ${e}`))
     // realtime: forward every local document change, coalesced per frame,
     // compacted, paced to ~30/s
@@ -262,12 +256,6 @@ function Net() {
       })}
       <div style={panel}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ live draw</div>
-        {peers.map((p) => (
-          <button key={p} title={p} style={btn} onClick={() => connect(p)}>
-            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: `hsl(${hue(p)} 85% 55%)`, marginRight: 6 }} />
-            {p.slice(0, 8)}…
-          </button>
-        ))}
         <button style={btn} onClick={() => setShowAdd((s) => !s)}>+</button>
         {showAdd && (
           <div>
