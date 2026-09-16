@@ -168,8 +168,11 @@ export default function App() {
         } catch (e) { setStatus(`room failed: ${e}`) }
       }
       if (viaLink && viaLink !== a) connect(viaLink)
-      // dev presence: signed register, then auto-dial every new peer seen.
-      // Skipped entirely where /api/presence doesn't answer (local server).
+      // dev presence (Pages only): LAN/local origins serve static files with
+      // no API, so don't even attempt — avoids console noise entirely.
+      const h = location.hostname
+      const isLocal = h === 'localhost' || h === '127.0.0.1' || /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(h)
+      if (isLocal) return
       const presence = async () => {
         try {
           const ts = Date.now()
