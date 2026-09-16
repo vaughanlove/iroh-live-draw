@@ -37,6 +37,7 @@ export default function App() {
   const [showAdd, setShowAdd] = useState(false)
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
   const remote = useRef(false)
+  const timers = useRef<number[]>([])
   const me = useRef('')
   const seq = useRef(0)
   const inRoom = useRef(false)
@@ -184,6 +185,7 @@ export default function App() {
       presence()
       timers.current.push(window.setInterval(presence, 20000))
     }).catch((e) => setStatus(`init failed: ${e}`))
+    return () => timers.current.forEach(clearInterval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
