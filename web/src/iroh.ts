@@ -29,7 +29,7 @@ export function irohPush(snapshot: string) {
 
 export function roomTopic(): string {
   if (!sync) throw new Error('init first')
-  return sync.room_topic()
+  return Sync.room_topic()
 }
 
 export async function roomJoin(topicHex: string, addrs: string[]): Promise<void> {
