@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Tldraw, useEditor, getSnapshot } from 'tldraw'
-import { irohInit, irohJoin, irohPush } from './iroh'
+import { irohInit, irohJoin, irohPush, roomTopic, roomJoin, roomPush } from './iroh'
 
 // navigator.clipboard needs HTTPS; plain-HTTP LAN (Android especially)
 // throws, so fall back to the legacy execCommand path.
@@ -44,9 +44,12 @@ function Net() {
   // each direct peer). Per-sender sequence numbers drop the odd stale frame.
   const me = useRef('')
   const seq = useRef(0)
+  const inRoom = useRef(false) // live traffic rides gossip once joined
   const lastSeq = useRef<Record<string, number>>({})
   const sendMsg = (obj: any) => {
-    irohPush(JSON.stringify({ from: me.current, seq: seq.current++, ...obj }))
+    const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
+    if (inRoom.current) roomPush(s)
+    else irohPush(s)
   }
   const connect = async (addr: string) => {
     setStatus('connecting…')
@@ -98,12 +101,20 @@ function Net() {
           mergeSnap(m.snapshot)
         } else mergeSnap(m) // legacy untagged full snapshot
       } catch {}
-    }).then((a) => {
+    }).then(async (a) => {
       setId(a)
       me.current = a.split(/\s/)[0] // node id portion of addr
       setStatus('ready')
-      // share-link autojoin: #peer=<addr>
-      const viaLink = new URLSearchParams(location.hash.slice(1)).get('peer')
+      // share-link autojoin: #t=<topic>&p=<addr> — gossip room for live
+      // traffic, direct dial for the initial snapshot
+      const q = new URLSearchParams(location.hash.slice(1))
+      const viaTopic = q.get('t'), viaLink = q.get('p')
+      if (viaTopic) {
+        try {
+          await roomJoin(viaTopic, viaLink && viaLink !== a ? [viaLink] : [])
+          inRoom.current = true
+        } catch (e) { setStatus(`room failed: ${e}`) }
+      }
       if (viaLink && viaLink !== a) connect(viaLink)
       // lobby: register + refresh peer list (server prunes stale entries)
       const reg = () => fetch('/api/peers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ addr: a }) }).catch(() => {})
@@ -205,7 +216,15 @@ function Net() {
           </div>
         )}
         <div style={{ marginTop: 6 }}>
-          <button disabled={!id} style={btn} onClick={() => copyText(`${location.origin}${location.pathname}#peer=${encodeURIComponent(id)}`).then(() => setStatus('share link copied — send it'))}>⧉ share</button>
+          <button disabled={!id} style={btn} onClick={async () => {
+            try {
+              const t = roomTopic()
+              await roomJoin(t, [])
+              inRoom.current = true
+              await copyText(`${location.origin}${location.pathname}#t=${t}&p=${encodeURIComponent(id)}`)
+              setStatus('share link copied — send it')
+            } catch (e) { setStatus(`share failed: ${e}`) }
+          }}>⧉ share</button>
           <button style={btn} onClick={() => {
             sendMsg({ t: 'snap', snapshot: getSnapshot(editor.store) })
             setStatus('synced')

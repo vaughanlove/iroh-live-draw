@@ -24,3 +24,20 @@ export function irohPush(snapshot: string) {
   if (!sync) return
   try { sync.push(snapshot) } catch {}
 }
+
+// --- gossip room (live patches + cursors). Snapshots stay direct. ---
+
+export function roomTopic(): string {
+  if (!sync) throw new Error('init first')
+  return sync.room_topic()
+}
+
+export async function roomJoin(topicHex: string, addrs: string[]): Promise<void> {
+  if (!sync) throw new Error('init first')
+  await sync.room_join(topicHex, addrs)
+}
+
+export function roomPush(s: string) {
+  if (!sync) return
+  try { sync.room_push(s) } catch {}
+}

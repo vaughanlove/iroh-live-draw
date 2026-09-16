@@ -1,6 +1,10 @@
 //! WASM iroh endpoint for browsers. Both peers (iPad + MacBook) run this.
 //! Browser sandbox has no UDP, so traffic flows via relay, E2E encrypted.
 use futures_util::StreamExt as _;
+use iroh_gossip::{
+    net::{Event, Gossip, GossipEvent, GossipSender},
+    proto::TopicId,
+};
 use wasm_bindgen::prelude::*;
 
 const ALPN: &[u8] = b"iroh-live-draw/0";
@@ -13,6 +17,8 @@ pub struct Sync {
     // slow/stalled peer can never stall the others.
     txs: std::sync::Arc<futures_util::lock::Mutex<Vec<futures_channel::mpsc::UnboundedSender<Vec<u8>>>>>,
     rx_cb: Option<js_sys::Function>,
+    gossip: Gossip,
+    room_tx: std::sync::Arc<futures_util::lock::Mutex<Option<GossipSender>>>,
 }
 
 async fn write_frame(s: &mut iroh::endpoint::SendStream, b: &[u8]) -> anyhow::Result<()> {
@@ -35,13 +41,22 @@ impl Sync {
                 iroh::SecretKey::from_bytes(&bytes)
             }
         };
-        let ep = iroh::Endpoint::builder().secret_key(secret).alpns(vec![ALPN.to_vec()]).bind().await.map_err(|e| e.to_string())?;
+        let ep = iroh::Endpoint::builder().secret_key(secret).alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()]).bind().await.map_err(|e| e.to_string())?;
+        let gossip = Gossip::builder().spawn(ep.clone()).await.map_err(|e| e.to_string())?;
         let txs = std::sync::Arc::new(futures_util::lock::Mutex::new(Vec::new()));
-        // accept loop: one queue+pump per inbound stream, plus a recv loop
-        let (ep2, txs2, on_remote2) = (ep.clone(), txs.clone(), on_remote.clone());
+        let room_tx = std::sync::Arc::new(futures_util::lock::Mutex::new(None));
+        // accept loop: gossip ALPN -> gossip actor, else our direct protocol
+        let (ep2, txs2, on_remote2, gossip2) = (ep.clone(), txs.clone(), on_remote.clone(), gossip.clone());
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(incoming) = ep2.accept().await {
                 if let Ok(conn) = incoming.await {
+                    if conn.alpn().as_deref() == Some(iroh_gossip::ALPN) {
+                        let g = gossip2.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let _ = g.handle_connection(conn).await;
+                        });
+                        continue;
+                    }
                     let (cb, t2) = (on_remote2.clone(), txs2.clone());
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Ok((mut s, mut r)) = conn.accept_bi().await {
@@ -64,7 +79,7 @@ impl Sync {
                 }
             }
         });
-        Ok(Sync { ep, txs, rx_cb: Some(on_remote) })
+        Ok(Sync { ep, txs, rx_cb: Some(on_remote), gossip, room_tx })
     }
 
     pub fn node_id(&self) -> String { self.ep.node_id().to_string() }
@@ -114,6 +129,56 @@ impl Sync {
 
     /// Push local snapshot to every connected peer (fire-and-forget).
     /// Dead streams are pruned.
+    /// Fresh random room topic as hex (for share links).
+    pub fn room_topic() -> Result<String, JsValue> {
+        let mut b = [0u8; 32];
+        getrandom::fill(&mut b).map_err(|e| e.to_string())?;
+        Ok(hex::encode(b))
+    }
+
+    /// Join a gossip room: seeds relay hints from `addrs` (JS array of
+    /// "<node-id> <relay-url>"), subscribes to the topic, and pumps received
+    /// messages into the JS callback. Live patches/cursors go over the room;
+    /// full snapshots stay on direct dials (see [`Sync::join`]).
+    pub async fn room_join(&self, topic_hex: &str, addrs: JsValue) -> Result<(), JsValue> {
+        let raw = hex::decode(topic_hex.trim()).map_err(|e| format!("bad topic: {e}"))?;
+        let arr: [u8; 32] = raw.try_into().map_err(|_| "bad topic length")?;
+        let topic: TopicId = arr.into();
+        let mut ids = Vec::new();
+        for v in js_sys::Array::from(&addrs).iter() {
+            if let Some(s) = v.as_string() {
+                if let Some((id_s, relay_s)) = s.trim().split_once(char::is_whitespace) {
+                    let id: iroh::NodeId = id_s.parse().map_err(|e| format!("bad node id: {e}"))?;
+                    let relay: iroh::RelayUrl = relay_s.trim().parse().map_err(|e| format!("bad relay url: {e}"))?;
+                    self.ep.add_node_addr(iroh::NodeAddr::new(id).with_relay_url(relay)).map_err(|e| e.to_string())?;
+                    ids.push(id);
+                }
+            }
+        }
+        let (sender, mut receiver) = self.gossip.subscribe(topic, ids).map_err(|e| e.to_string())?.split();
+        *self.room_tx.lock().await = Some(sender);
+        if let Some(cb) = self.rx_cb.clone() {
+            wasm_bindgen_futures::spawn_local(async move {
+                while let Some(ev) = receiver.next().await {
+                    if let Ok(Event::Gossip(GossipEvent::Received(msg))) = ev {
+                        let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&String::from_utf8_lossy(&msg.content)));
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Broadcast a message to the room (no-op if not joined).
+    pub fn room_push(&self, s: &str) {
+        let (t, b) = (self.room_tx.clone(), bytes::Bytes::from(s.as_bytes().to_vec()));
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(sender) = t.lock().await.clone() {
+                let _ = sender.broadcast(b).await;
+            }
+        });
+    }
+
     /// Enqueue a message for every connected peer (never blocks).
     /// Dead peers are pruned; per-peer pumps preserve send order.
     pub fn push(&self, snapshot: &str) {
