@@ -8,9 +8,12 @@ const KEY = 'iroh-live-draw-secret'
 
 export async function irohInit(onRemote: (snap: string) => void): Promise<string> {
   await init()
-  sync = await Sync.create(localStorage.getItem(KEY), onRemote)
-  // persist identity: same node id / addr on every load per device
-  try { localStorage.setItem(KEY, sync.secret_key()) } catch {}
+  // Tab-scoped identity: two tabs on one origin must be two different peers.
+  // (localStorage is shared per origin — it gave every tab the same node ID,
+  // so dials self-routed and relays couldn't tell tabs apart.)
+  let secret = sessionStorage.getItem(KEY)
+  sync = await Sync.create(secret)
+  try { sessionStorage.setItem(KEY, sync.secret_key()) } catch {}
   // Full dial string (node id + home relay) — needed: no discovery in browser.
   return sync.addr()
 }
