@@ -123,10 +123,15 @@ export default function App() {
     }
   }
 
-  // join (or create) a room channel and pump its receiver stream
+  // join (or create) a room channel and pump its receiver stream.
+  // Re-joining the same channel object is a no-op (its stream stays locked
+  // to the original reader); a new channel abandons the old pump via gen.
+  const pumpingFor = useRef<any>(null)
   const joinChannel = async (ch: any) => {
     const gen = ++roomGen.current
     chanRef.current = ch
+    if (pumpingFor.current === ch) return
+    pumpingFor.current = ch
     const reader = (ch.receiver as ReadableStream).getReader()
     setStatus('connected — draw!')
     try {
@@ -138,6 +143,7 @@ export default function App() {
     } catch {
       /* stream closed */
     } finally {
+      if (pumpingFor.current === ch) pumpingFor.current = null
       try { reader.releaseLock() } catch {}
     }
   }
