@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
 import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
-import { irohInit, irohJoin, irohPush, peerCount, signPresence } from './iroh'
+import { ChatNode } from './pkg/draw_browser_wasm.js'
 import '@excalidraw/excalidraw/index.css'
 
 // navigator.clipboard needs HTTPS; plain-HTTP LAN (Android especially)
@@ -21,12 +21,6 @@ async function copyText(t: string) {
   }
 }
 
-const hue = (s: string) => {
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360
-  return h
-}
-
 type PeerCursor = { x: number; y: number; at: number }
 
 export default function App() {
@@ -37,6 +31,7 @@ export default function App() {
   const [showAdd, setShowAdd] = useState(false)
   const [showDbg, setShowDbg] = useState(false)
   const [dbg, setDbg] = useState('')
+  const [online, setOnline] = useState<Record<string, string>>({})
   // event stats: per-type counters + rolling throughput
   const stats = useRef({ sent: {} as Record<string, number>, recv: {} as Record<string, number>, stale: 0 })
   const times = useRef<number[]>([])
@@ -47,82 +42,149 @@ export default function App() {
   }
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
   const remote = useRef(false)
-  const timers = useRef<number[]>([])
+  const nodeRef = useRef<any>(null)
+  const chanRef = useRef<any>(null)
+  const roomGen = useRef(0)
   const me = useRef('')
+  const nick = useRef('')
   const seq = useRef(0)
-  const dialed = useRef<Set<string>>(new Set()) // presence auto-dial dedup
   const lastSeq = useRef<Record<string, number>>({})
   const cursors = useRef<Record<string, PeerCursor>>({})
   const lastPtr = useRef(0)
+  const onlineRef = useRef<Record<string, string>>({})
 
-  // direct broadcast to every connected peer (localized neighborhood —
-  // no gossip layer). Per-sender sequence numbers drop the odd stale frame.
   const sendMsg = (obj: any) => {
+    const ch = chanRef.current
+    if (!ch) return
     bump('sent', obj?.t ?? '?')
-    irohPush(JSON.stringify({ from: me.current, seq: seq.current++, ...obj }))
-  }
-  const connect = async (addr: string) => {
-    setStatus('connecting…')
-    try {
-      await irohJoin(addr, JSON.stringify({ from: me.current, seq: seq.current++, t: 'snap-req' }))
-      setStatus('connected — draw!')
-    } catch (e) { setStatus(`connect failed: ${e}`) }
+    const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
+    ch.sender.broadcast(s).catch(() => {})
   }
 
-  // inbound: patches merge via reconcile, snaps load as-is, cursors tracked.
-  // Single irohInit (see init effect); this ref always points at fresh logic.
-  const handleRef = useRef((_raw: string) => {})
-  handleRef.current = (msg: string) => {
-    try {
-      const m = JSON.parse(msg)
-      bump('recv', m?.t ?? (Array.isArray(m) ? 'legacy' : '?'))
-      if (m?.t === 'cursor' && m.from && m.from !== me.current) {
-        cursors.current[m.from] = { x: m.x, y: m.y, at: Date.now() }
-        pushCollaborators()
-        return
-      }
-        if (m?.t === 'p') {
-          if (typeof m.seq === 'number' && m.from) {
-            if (m.seq <= (lastSeq.current[m.from] ?? -1)) { stats.current.stale++; return }
-            lastSeq.current[m.from] = m.seq
-          }
-          // apply immediately (no queue): keeps latency at one frame
-          if (Array.isArray(m.elements)) applyRemote(m.elements)
-        } else if (m?.t === 'snap-req') {
-        sendMsg({ t: 'snap', elements: apiRef.current?.getSceneElements() ?? [] })
-      } else if (m?.t === 'snap' || m?.t === 'snap-back') {
-        if (Array.isArray(m.elements)) applyRemote(m.elements)
-      } else if (Array.isArray(m)) {
-        applyRemote(m) // legacy untagged
-      }
-    } catch {}
-  }
-
-  const applyRemote = (elements: any[]) => {
+  const applyRemote = (elements: any[], asIs: boolean) => {
     const a = apiRef.current
-    if (!a) return
+    if (!a || !Array.isArray(elements)) return
     remote.current = true
     try {
-      a.updateScene({ elements: reconcileElements(a.getSceneElements(), elements, a.getAppState()) as OrderedExcalidrawElement[] })
+      if (asIs) {
+        a.updateScene({ elements: elements as OrderedExcalidrawElement[], commitToHistory: false })
+      } else {
+        a.updateScene({ elements: reconcileElements(a.getSceneElements(), elements, a.getAppState()) })
+      }
       for (const el of a.getSceneElements()) sentVersions.current[el.id] = el.version
     } finally {
       remote.current = false
     }
   }
 
-  // debug drawer data (rendered only when open)
+  const setPresence = (from: string, nickname: string) => {
+    if (from === me.current) return
+    onlineRef.current = { ...onlineRef.current, [from]: nickname || from.slice(0, 6) }
+    setOnline(onlineRef.current)
+  }
+
+  // inbound gossip event from the room channel
+  const onRoomEvent = (ev: any) => {
+    if (!ev || typeof ev.type !== 'string') return
+    if (ev.type === 'presence') {
+      setPresence(String(ev.from), ev.nickname)
+      return
+    }
+    if (ev.type === 'neighborUp') {
+      setPresence(String(ev.endpoint_id ?? ev.endpointId ?? ''), '')
+      return
+    }
+    if (ev.type === 'messageReceived') {
+      let m: any
+      try {
+        m = JSON.parse(ev.text)
+      } catch {
+        return
+      }
+      bump('recv', m?.t ?? '?')
+      const from = String(ev.from ?? m.from ?? '')
+      if (from === me.current) return
+      if (m?.t === 'cursor') {
+        cursors.current[from] = { x: m.x, y: m.y, at: Date.now() }
+        pushCollaborators()
+        return
+      }
+      if (m?.t === 'p') {
+        if (typeof m.seq === 'number') {
+          if (m.seq <= (lastSeq.current[from] ?? -1)) { stats.current.stale++; return }
+          lastSeq.current[from] = m.seq
+        }
+        if (Array.isArray(m.elements)) applyRemote(m.elements, false)
+      } else if (m?.t === 'snap-req') {
+        sendMsg({ t: 'snap', elements: apiRef.current?.getSceneElements() ?? [] })
+      } else if (m?.t === 'snap') {
+        if (Array.isArray(m.elements)) applyRemote(m.elements, true)
+      }
+    }
+  }
+
+  // join (or create) a room channel and pump its receiver stream
+  const joinChannel = async (ch: any) => {
+    const gen = ++roomGen.current
+    chanRef.current = ch
+    const reader = (ch.receiver as ReadableStream).getReader()
+    setStatus('connected — draw!')
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done || gen !== roomGen.current) break
+        onRoomEvent(value)
+      }
+    } catch {
+      /* stream closed */
+    } finally {
+      try { reader.releaseLock() } catch {}
+    }
+  }
+
+  const pushCollaborators = () => {
+    const a = apiRef.current
+    if (!a) return
+    const map = new Map()
+    for (const [from, c] of Object.entries(cursors.current)) {
+      map.set(from, {
+        pointer: { x: c.x, y: c.y, tool: 'pointer' },
+        button: 'up',
+        username: (onlineRef.current[from] ?? from.slice(0, 6)),
+      })
+    }
+    a.updateScene({ collaborators: map as any })
+  }
+
+  // boot: node identity (ephemeral), then room from share link if present
   useEffect(() => {
-    const t = window.setInterval(() => {
-      const now = Date.now()
-      times.current = times.current.filter((ts) => now - ts < 2000)
-      const s = stats.current
-      const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
-      setDbg(
-        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\npeers: ${peerCount()} dialed: ${dialed.current.size} me: ${me.current.slice(0, 8)}`,
-      )
-    }, 500)
-    return () => clearInterval(t)
+    let dead = false
+    ;(async () => {
+      try {
+        const node = await ChatNode.spawn()
+        if (dead) return
+        nodeRef.current = node
+        const myId = node.endpoint_id() as string
+        me.current = myId
+        nick.current = 'peer-' + myId.slice(0, 6)
+        setId(myId)
+        setStatus('ready')
+        const ticket = new URLSearchParams(location.hash.slice(1)).get('t')
+        if (ticket) {
+          setStatus('joining…')
+          const ch = await node.join(ticket, nick.current)
+          if (dead) return
+          await joinChannel(ch)
+          sendMsg({ t: 'snap-req' })
+        }
+      } catch (e) {
+        if (!dead) setStatus(`init failed: ${e}`)
+      }
+    })()
+    return () => { dead = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
   // prune stale cursors
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -136,65 +198,24 @@ export default function App() {
     return () => clearInterval(t)
   }, [])
 
-  const pushCollaborators = () => {
-    const a = apiRef.current
-    if (!a) return
-    const map = new Map()
-    for (const [from, c] of Object.entries(cursors.current)) {
-      map.set(from, {
-        pointer: { x: c.x, y: c.y, tool: 'pointer' },
-        button: 'up',
-        username: from.slice(0, 6),
-        color: { Background: `hsl(${hue(from)} 85% 55%)`, Stroke: `hsl(${hue(from)} 85% 55%)` },
-      })
-    }
-    a.updateScene({ collaborators: map as any })
-  }
-
-  // init: identity, share-link autojoin (direct dial for snapshot)
+  // debug drawer data (rendered only when open)
   useEffect(() => {
-    irohInit((msg) => handleRef.current(msg)).then(async (a) => {
-      setId(a)
-      me.current = a.split(/\s/)[0]
-      setStatus('ready')
-      const viaLink = new URLSearchParams(location.hash.slice(1)).get('p')
-      if (viaLink && viaLink !== a) connect(viaLink)
-      // dev presence (Pages only): LAN/local origins serve static files with
-      // no API, so don't even attempt — avoids console noise entirely.
-      const h = location.hostname
-      const isLocal = h === 'localhost' || h === '127.0.0.1' || /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(h)
-      if (isLocal) return
-      const presence = async () => {
-        try {
-          const ts = Date.now()
-          const msg = `${me.current}.${a}.${ts}`
-          const reg = await fetch('/api/presence', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ nodeId: me.current, addr: a, ts, sig: signPresence(msg) }),
-          })
-          if (!reg.ok) return false
-          const peers: { nodeId: string; addr: string }[] = await (await fetch('/api/presence')).json()
-          const fresh = peers.filter((p) => p?.nodeId && p.nodeId !== me.current && p.addr && !dialed.current.has(p.nodeId))
-          for (const p of fresh) {
-            dialed.current.add(p.nodeId)
-            connect(p.addr)
-          }
-          return true
-        } catch {}
-        return false
-      }
-      if (await presence()) timers.current.push(window.setInterval(presence, 20000))
-    }).catch((e) => setStatus(`init failed: ${e}`))
-    return () => timers.current.forEach(clearInterval)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const t = window.setInterval(() => {
+      const now = Date.now()
+      times.current = times.current.filter((ts) => now - ts < 2000)
+      const s = stats.current
+      const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
+      setDbg(
+        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\nonline: ${Object.keys(onlineRef.current).length} me: ${me.current.slice(0, 8)}`,
+      )
+    }, 500)
+    return () => clearInterval(t)
   }, [])
 
-  // local edits -> broadcast only version-bumped elements (~60/s).
-  // Keeps every message far under gossip's size cap.
+  // local edits -> broadcast only version-bumped elements (~60/s)
   const sentVersions = useRef<Record<string, number>>({})
   const onChange = (elements: readonly OrderedExcalidrawElement[]) => {
-    if (remote.current || !me.current) return
+    if (remote.current || !me.current || !chanRef.current) return
     const changed = elements.filter((el: any) => sentVersions.current[el.id] !== el.version)
     if (!changed.length) return
     for (const el of changed as any[]) sentVersions.current[el.id] = el.version
@@ -203,9 +224,23 @@ export default function App() {
 
   const onPointerUpdate = (payload: { pointer: { x: number; y: number } }) => {
     const now = Date.now()
-    if (now - lastPtr.current < 80 || !me.current) return
+    if (now - lastPtr.current < 80 || !me.current || !chanRef.current) return
     lastPtr.current = now
     sendMsg({ t: 'cursor', x: payload.pointer.x, y: payload.pointer.y })
+  }
+
+  const share = async () => {
+    const node = nodeRef.current
+    if (!node) return
+    try {
+      const ch = chanRef.current ?? (await node.create(nick.current))
+      await joinChannel(ch)
+      const ticket = ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
+      await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
+      setStatus('share link copied — send it')
+    } catch (e) {
+      setStatus(`share failed: ${e}`)
+    }
   }
 
   const panel: React.CSSProperties = {
@@ -222,6 +257,7 @@ export default function App() {
     width: '100%', margin: '6px 0', background: '#fff', color: '#1a1d26',
     border: '1px solid #00000022', borderRadius: 8, padding: '5px 8px', fontSize: 12,
   }
+  const names = Object.values(online)
   return (
     <div style={{ position: 'fixed', inset: 0 }}>
       <Excalidraw
@@ -232,15 +268,26 @@ export default function App() {
       />
       <div style={panel}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ live draw</div>
+        {names.length > 0 && (
+          <div style={{ opacity: 0.75, marginBottom: 4 }}>online: {names.join(', ')}</div>
+        )}
         <button style={btn} onClick={() => setShowAdd((s) => !s)}>+</button>
         {showAdd && (
           <div>
-            <input placeholder="paste peer addr…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
-            <button style={btn} onClick={() => { connect(peer); setShowAdd(false) }}>connect</button>
+            <input placeholder="paste ticket…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
+            <button style={btn} onClick={async () => {
+              setShowAdd(false)
+              setStatus('joining…')
+              try {
+                const ch = await nodeRef.current.join(peer.trim(), nick.current)
+                await joinChannel(ch)
+                sendMsg({ t: 'snap-req' })
+              } catch (e) { setStatus(`join failed: ${e}`) }
+            }}>join</button>
           </div>
         )}
         <div style={{ marginTop: 6 }}>
-          <button disabled={!id} style={btn} onClick={() => copyText(`${location.origin}${location.pathname}#p=${encodeURIComponent(id)}`).then(() => setStatus('share link copied — send it'))}>⧉ share</button>
+          <button disabled={!id} style={btn} onClick={share}>⧉ share</button>
           <button style={btn} onClick={() => {
             sendMsg({ t: 'snap-req' })
             setStatus('reloading board…')

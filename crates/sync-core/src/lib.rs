@@ -16,6 +16,7 @@ pub struct Sync {
 }
 
 async fn write_frame(s: &mut iroh::endpoint::SendStream, b: &[u8]) -> anyhow::Result<()> {
+    println!("write_frame: len={}", b.len());
     s.write_all(&(b.len() as u32).to_be_bytes()).await?;
     s.write_all(b).await?;
     Ok(())
