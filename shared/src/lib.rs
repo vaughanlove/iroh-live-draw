@@ -84,7 +84,11 @@ impl ChatNode {
         info!("endpoint bound");
         info!("endpoint id: {endpoint_id:#?}");
 
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        // gossip drops oversize messages silently (default cap is 4KB) —
+        // scenes and busy strokes need headroom
+        let gossip = Gossip::builder()
+            .max_message_size(1024 * 256)
+            .spawn(endpoint.clone());
         info!("gossip spawned");
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())

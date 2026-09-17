@@ -58,7 +58,7 @@ export default function App() {
     if (!ch) return
     bump('sent', obj?.t ?? '?')
     const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
-    ch.sender.broadcast(s).catch(() => {})
+    ch.sender.broadcast(s).catch(() => bump('sent', 'drop'))
   }
 
   const applyRemote = (elements: any[], asIs: boolean) => {
