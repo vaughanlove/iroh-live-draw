@@ -1,38 +1,46 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 pub use iroh::EndpointId;
-use iroh::{protocol::Router, PublicKey, SecretKey, Signature};
+pub use iroh::RelayUrl;
+use iroh::{
+    EndpointAddr, PublicKey, SecretKey, Signature, TransportAddr, protocol::Router,
+};
+use iroh::address_lookup::memory::MemoryLookup;
 pub use iroh_gossip::proto::TopicId;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
-    net::{Gossip, GOSSIP_ALPN},
+    net::{GOSSIP_ALPN, Gossip},
 };
 use iroh_tickets::Ticket;
 use n0_future::{
+    StreamExt,
     boxed::BoxStream,
     task::{self, AbortOnDropHandle},
     time::{Duration, SystemTime},
-    StreamExt,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tracing::{debug, info, warn};
 
-pub const TOPIC_PREFIX: &str = "iroh-example-chat/0:";
-pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
+pub const TOPIC_PREFIX: &str = "iroh-draw/0:";
+pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(5); // what is this?
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatTicket {
+pub struct DrawTicket {
     pub topic_id: TopicId,
-    pub bootstrap: BTreeSet<EndpointId>,
+    pub bootstrap: BTreeSet<EndpointId>, // an ordered set of endpoint ids
+    /// Known relay homes, so joiners can dial without working discovery
+    /// (browsers can't resolve bare IDs). Absent entries ride unresolved.
+    pub relays: BTreeMap<EndpointId, RelayUrl>,
 }
 
-impl ChatTicket {
+impl DrawTicket {
     pub fn new_random() -> Self {
+        //generate a random topic id. this is probably what we would want to make persistent or give the option to load from previous?
         let topic_id = TopicId::from_bytes(rand::random());
         Self::new(topic_id)
     }
@@ -40,19 +48,20 @@ impl ChatTicket {
     pub fn new(topic_id: TopicId) -> Self {
         Self {
             topic_id,
-            bootstrap: Default::default(),
+            bootstrap: Default::default(), // an empty set
+            relays: Default::default(),
         }
     }
     pub fn deserialize(input: &str) -> Result<Self> {
-        <Self as Ticket>::decode_string(input).map_err(Into::into)
+        <Self as Ticket>::decode_string(input).map_err(Into::into) // why do we need this and where is it currently used?
     }
     pub fn serialize(&self) -> String {
-        <Self as Ticket>::encode_string(self)
+        <Self as Ticket>::encode_string(self) // above
     }
 }
 
-impl Ticket for ChatTicket {
-    const KIND: &'static str = "chat";
+impl Ticket for DrawTicket {
+    const KIND: &'static str = "draw";
 
     fn encode_bytes(&self) -> Vec<u8> {
         postcard::to_stdvec(&self).unwrap()
@@ -64,13 +73,15 @@ impl Ticket for ChatTicket {
     }
 }
 
-pub struct ChatNode {
+#[derive(Clone)]
+pub struct DrawNode {
     secret_key: SecretKey,
     router: Router,
     gossip: Gossip,
+    lookup: MemoryLookup,
 }
 
-impl ChatNode {
+impl DrawNode {
     /// Spawns a gossip node.
     pub async fn spawn(secret_key: Option<SecretKey>) -> Result<Self> {
         let secret_key = secret_key.unwrap_or_else(SecretKey::generate);
@@ -84,11 +95,13 @@ impl ChatNode {
         info!("endpoint bound");
         info!("endpoint id: {endpoint_id:#?}");
 
-        // gossip drops oversize messages silently (default cap is 4KB) —
-        // scenes and busy strokes need headroom
-        let gossip = Gossip::builder()
-            .max_message_size(1024 * 256)
-            .spawn(endpoint.clone());
+        // Out-of-band address book: the browser can't resolve bare endpoint
+        // IDs (no working discovery), so relay hints from tickets go here and
+        // gossip dials resolve through it.
+        let lookup = MemoryLookup::new();
+        endpoint.address_lookup()?.add(lookup.clone());
+
+        let gossip = Gossip::builder().spawn(endpoint.clone());
         info!("gossip spawned");
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())
@@ -98,6 +111,7 @@ impl ChatNode {
             gossip,
             router,
             secret_key,
+            lookup,
         })
     }
 
@@ -106,17 +120,35 @@ impl ChatNode {
         self.router.endpoint().id()
     }
 
+    /// Our current home relay, if the endpoint has settled on one. Tickets
+    /// carry this so joiners can dial us without discovery.
+    pub fn relay_url(&self) -> Option<RelayUrl> {
+        self.router.endpoint().addr().addrs.iter().find_map(|a| match a {
+            TransportAddr::Relay(url) => Some(url.clone()),
+            _ => None,
+        })
+    }
+
     /// Joins a chat channel from a ticket.
     ///
     /// Returns a [`ChatSender`] to send messages or change our nickname
     /// and a stream of [`Event`] items for incoming messages and other event.s
     pub async fn join(
         &self,
-        ticket: &ChatTicket,
+        ticket: &DrawTicket,
         nickname: String,
     ) -> Result<(ChatSender, BoxStream<Result<Event>>)> {
         let topic_id = ticket.topic_id;
         let bootstrap = ticket.bootstrap.iter().cloned().collect();
+        // Seed relay hints before subscribing so bootstrap dials resolve
+        // without discovery.
+        for (id, url) in &ticket.relays {
+            let addr = EndpointAddr {
+                id: *id,
+                addrs: BTreeSet::from([TransportAddr::Relay(url.clone())]),
+            };
+            self.lookup.add_endpoint_info(addr);
+        }
         info!(?bootstrap, "joining {topic_id}");
         let gossip_topic = self.gossip.subscribe(topic_id, bootstrap).await?;
         let (sender, receiver) = gossip_topic.split();

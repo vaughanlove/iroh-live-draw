@@ -108,43 +108,43 @@ export class ChannelSender {
     /**
      * @param {string} nickname
      */
-    set_nickame(nickname) {
+    set_nickname(nickname) {
         const ptr0 = passStringToWasm0(nickname, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.channelsender_set_nickame(this.__wbg_ptr, ptr0, len0);
+        wasm.channelsender_set_nickname(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) ChannelSender.prototype[Symbol.dispose] = ChannelSender.prototype.free;
 
 /**
- * Node for chatting over iroh-gossip
+ * Node for drawing together over iroh-gossip
  */
-export class ChatNode {
+export class DrawNode {
     static __wrap(ptr) {
-        const obj = Object.create(ChatNode.prototype);
+        const obj = Object.create(DrawNode.prototype);
         obj.__wbg_ptr = ptr;
-        ChatNodeFinalization.register(obj, obj.__wbg_ptr, obj);
+        DrawNodeFinalization.register(obj, obj.__wbg_ptr, obj);
         return obj;
     }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
-        ChatNodeFinalization.unregister(this);
+        DrawNodeFinalization.unregister(this);
         return ptr;
     }
     free() {
         const ptr = this.__destroy_into_raw();
-        wasm.__wbg_chatnode_free(ptr, 0);
+        wasm.__wbg_drawnode_free(ptr, 0);
     }
     /**
-     * Opens a chat.
+     * Opens a drawing room.
      * @param {string} nickname
      * @returns {Promise<Channel>}
      */
     create(nickname) {
         const ptr0 = passStringToWasm0(nickname, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.chatnode_create(this.__wbg_ptr, ptr0, len0);
+        const ret = wasm.drawnode_create(this.__wbg_ptr, ptr0, len0);
         return ret;
     }
     /**
@@ -155,7 +155,7 @@ export class ChatNode {
         let deferred1_0;
         let deferred1_1;
         try {
-            const ret = wasm.chatnode_endpoint_id(this.__wbg_ptr);
+            const ret = wasm.drawnode_endpoint_id(this.__wbg_ptr);
             deferred1_0 = ret[0];
             deferred1_1 = ret[1];
             return getStringFromWasm0(ret[0], ret[1]);
@@ -164,7 +164,7 @@ export class ChatNode {
         }
     }
     /**
-     * Joins a chat.
+     * Joins a drawing room.
      * @param {string} ticket
      * @param {string} nickname
      * @returns {Promise<Channel>}
@@ -174,19 +174,33 @@ export class ChatNode {
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(nickname, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.chatnode_join(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        const ret = wasm.drawnode_join(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         return ret;
     }
     /**
+     * Our current home relay URL, if known yet. Included in tickets so
+     * joiners can dial us without working discovery.
+     * @returns {string | undefined}
+     */
+    relay_url() {
+        const ret = wasm.drawnode_relay_url(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]);
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
      * Spawns a gossip node.
-     * @returns {Promise<ChatNode>}
+     * @returns {Promise<DrawNode>}
      */
     static spawn() {
-        const ret = wasm.chatnode_spawn();
+        const ret = wasm.drawnode_spawn();
         return ret;
     }
 }
-if (Symbol.dispose) ChatNode.prototype[Symbol.dispose] = ChatNode.prototype.free;
+if (Symbol.dispose) DrawNode.prototype[Symbol.dispose] = DrawNode.prototype.free;
 
 export class IntoUnderlyingByteSource {
     __destroy_into_raw() {
@@ -428,10 +442,6 @@ export function __wbg_channel_new(arg0) {
     const ret = Channel.__wrap(arg0);
     return ret;
 }
-export function __wbg_chatnode_new(arg0) {
-    const ret = ChatNode.__wrap(arg0);
-    return ret;
-}
 export function __wbg_clearTimeout_1daad5c6ee4fcd3b(arg0) {
     const ret = clearTimeout(arg0);
     return ret;
@@ -471,6 +481,10 @@ export function __wbg_debug_d3d0e490f96087b4(arg0, arg1) {
 }
 export function __wbg_done_cffed884d87aa22e(arg0) {
     const ret = arg0.done;
+    return ret;
+}
+export function __wbg_drawnode_new(arg0) {
+    const ret = DrawNode.__wrap(arg0);
     return ret;
 }
 export function __wbg_enqueue_6cb545d22db14f33() { return handleError(function (arg0, arg1) {
@@ -910,42 +924,42 @@ export function __wbg_wasClean_a32ef5f1fd90161e(arg0) {
     return ret;
 }
 export function __wbindgen_generic_0000000000000001(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2954, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2987, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb524c411cc4612b6);
     return ret;
 }
 export function __wbindgen_generic_0000000000000002(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4913, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4946, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4c9b27a236c12df4);
     return ret;
 }
 export function __wbindgen_generic_0000000000000003(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1684, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1714, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1c3399259ee45d8a);
     return ret;
 }
 export function __wbindgen_generic_0000000000000004(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3617, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3650, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h79bd56fd0616473d);
     return ret;
 }
 export function __wbindgen_generic_0000000000000005(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 2919, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 2952, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23f7e27b78ef2f58);
     return ret;
 }
 export function __wbindgen_generic_0000000000000006(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3154, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3187, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1b297369af64787e);
     return ret;
 }
 export function __wbindgen_generic_0000000000000007(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3178, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3211, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
     const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__he0976379ed5281ba);
     return ret;
 }
 export function __wbindgen_generic_0000000000000008(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 4884, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 4917, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h46f28b73f3eb178c);
     return ret;
 }
@@ -1040,9 +1054,9 @@ const ChannelFinalization = (typeof FinalizationRegistry === 'undefined')
 const ChannelSenderFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_channelsender_free(ptr, 1));
-const ChatNodeFinalization = (typeof FinalizationRegistry === 'undefined')
+const DrawNodeFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_chatnode_free(ptr, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_drawnode_free(ptr, 1));
 const IntoUnderlyingByteSourceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_intounderlyingbytesource_free(ptr, 1));

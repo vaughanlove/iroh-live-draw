@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
 import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
-import { ChatNode } from './pkg/draw_browser_wasm.js'
+import { DrawNode } from './pkg/draw_browser_wasm.js'
 import '@excalidraw/excalidraw/index.css'
 
 // navigator.clipboard needs HTTPS; plain-HTTP LAN (Android especially)
@@ -167,7 +167,7 @@ export default function App() {
     let dead = false
     ;(async () => {
       try {
-        const node = await ChatNode.spawn()
+        const node = await DrawNode.spawn()
         if (dead) return
         nodeRef.current = node
         const myId = node.endpoint_id() as string

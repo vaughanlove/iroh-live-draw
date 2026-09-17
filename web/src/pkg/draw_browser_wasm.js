@@ -5,5 +5,5 @@ import { __wbg_set_wasm } from "./draw_browser_wasm_bg.js";
 __wbg_set_wasm(wasm);
 wasm.__wbindgen_start();
 export {
-    Channel, ChannelSender, ChatNode, IntoUnderlyingByteSource, IntoUnderlyingSink, IntoUnderlyingSource, start
+    Channel, ChannelSender, DrawNode, IntoUnderlyingByteSource, IntoUnderlyingSink, IntoUnderlyingSource, start
 } from "./draw_browser_wasm_bg.js";

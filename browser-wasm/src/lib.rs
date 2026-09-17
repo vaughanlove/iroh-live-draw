@@ -1,10 +1,11 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
 use anyhow::Result;
-use draw_shared::{ChatSender, ChatTicket, EndpointId, TopicId};
+use draw_shared::{ChatSender, DrawTicket, EndpointId, RelayUrl, TopicId};
+use draw_shared::DrawNode as SharedNode;
 use n0_future::{StreamExt, time::Duration};
 use serde::{Deserialize, Serialize};
 use tracing::level_filters::LevelFilter;
@@ -30,15 +31,15 @@ fn start() {
     tracing::info!("(testing logging) Logging setup");
 }
 
-/// Node for chatting over iroh-gossip
+/// Node for drawing together over iroh-gossip
 #[wasm_bindgen]
-pub struct ChatNode(draw_shared::ChatNode);
+pub struct DrawNode(SharedNode);
 
 #[wasm_bindgen]
-impl ChatNode {
+impl DrawNode {
     /// Spawns a gossip node.
     pub async fn spawn() -> Result<Self, JsError> {
-        let inner = draw_shared::ChatNode::spawn(None)
+        let inner = SharedNode::spawn(None)
             .await
             .map_err(to_js_err)?;
         Ok(Self(inner))
@@ -49,20 +50,25 @@ impl ChatNode {
         self.0.endpoint_id().to_string()
     }
 
-    /// Opens a chat.
+    /// Our current home relay URL, if known yet. Included in tickets so
+    /// joiners can dial us without working discovery.
+    pub fn relay_url(&self) -> Option<String> {
+        self.0.relay_url().map(|u| u.to_string())
+    }
+
+    /// Opens a drawing room.
     pub async fn create(&self, nickname: String) -> Result<Channel, JsError> {
-        // let ticket = ChatTicket::new(topic);
-        let ticket = ChatTicket::new_random();
+        let ticket = DrawTicket::new_random();
         self.join_inner(ticket, nickname).await
     }
 
-    /// Joins a chat.
+    /// Joins a drawing room.
     pub async fn join(&self, ticket: String, nickname: String) -> Result<Channel, JsError> {
-        let ticket = ChatTicket::deserialize(&ticket).map_err(to_js_err)?;
+        let ticket = DrawTicket::deserialize(&ticket).map_err(to_js_err)?;
         self.join_inner(ticket, nickname).await
     }
 
-    async fn join_inner(&self, ticket: ChatTicket, nickname: String) -> Result<Channel, JsError> {
+    async fn join_inner(&self, ticket: DrawTicket, nickname: String) -> Result<Channel, JsError> {
         let (sender, receiver) = self.0.join(&ticket, nickname).await.map_err(to_js_err)?;
         let sender = ChannelSender(sender);
         let neighbors = Arc::new(Mutex::new(BTreeSet::new()));
@@ -88,14 +94,21 @@ impl ChatNode {
         });
         let receiver = ReadableStream::from_stream(receiver).into_raw();
 
+        // Carry relay hints forward so re-shared tickets stay dialable.
+        let mut relays = ticket.relays.clone();
+        // Add ourselves (live value — the relay may have settled since join).
+        if let Some(url) = self.0.relay_url() {
+            relays.insert(self.0.endpoint_id(), url);
+        }
+
         // Add ourselves to the ticket.
         let mut ticket = ticket;
         ticket.bootstrap.insert(self.0.endpoint_id());
-        // ticket.bootstrap = [self.0.endpoint_id()].into_iter().collect();
 
         let topic = Channel {
             topic_id: ticket.topic_id,
             bootstrap: ticket.bootstrap,
+            relays,
             neighbors,
             me: self.0.endpoint_id(),
             sender,
@@ -112,6 +125,7 @@ pub struct Channel {
     topic_id: TopicId,
     me: EndpointId,
     bootstrap: BTreeSet<EndpointId>,
+    relays: BTreeMap<EndpointId, RelayUrl>,
     neighbors: Arc<Mutex<BTreeSet<EndpointId>>>,
     sender: ChannelSender,
     receiver: ChannelReceiver,
@@ -131,16 +145,25 @@ impl Channel {
 
     pub fn ticket(&self, opts: JsValue) -> Result<String, JsError> {
         let opts: TicketOpts = serde_wasm_bindgen::from_value(opts)?;
-        let mut ticket = ChatTicket::new(self.topic_id);
+        let mut ticket = DrawTicket::new(self.topic_id);
+        // Only include relay hints we actually have; bare IDs ride along
+        // unresolved (same as before) rather than blocking the ticket.
+        let mut include = Vec::new();
         if opts.include_myself {
-            ticket.bootstrap.insert(self.me);
+            include.push(self.me);
         }
         if opts.include_bootstrap {
-            ticket.bootstrap.extend(self.bootstrap.iter().copied());
+            include.extend(self.bootstrap.iter().copied());
         }
         if opts.include_neighbors {
             let neighbors = self.neighbors.lock().unwrap();
-            ticket.bootstrap.extend(neighbors.iter().copied())
+            include.extend(neighbors.iter().copied());
+        }
+        for id in include {
+            ticket.bootstrap.insert(id);
+            if let Some(url) = self.relays.get(&id) {
+                ticket.relays.insert(id, url.clone());
+            }
         }
         tracing::info!("opts {:?} ticket {:?}", opts, ticket);
         Ok(ticket.serialize())
@@ -186,7 +209,7 @@ impl ChannelSender {
         Ok(())
     }
 
-    pub fn set_nickame(&self, nickname: String) {
+    pub fn set_nickname(&self, nickname: String) {
         self.0.set_nickname(nickname);
     }
 }

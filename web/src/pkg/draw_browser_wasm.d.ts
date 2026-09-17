@@ -24,18 +24,18 @@ export class ChannelSender {
     free(): void;
     [Symbol.dispose](): void;
     broadcast(text: string): Promise<void>;
-    set_nickame(nickname: string): void;
+    set_nickname(nickname: string): void;
 }
 
 /**
- * Node for chatting over iroh-gossip
+ * Node for drawing together over iroh-gossip
  */
-export class ChatNode {
+export class DrawNode {
     private constructor();
     free(): void;
     [Symbol.dispose](): void;
     /**
-     * Opens a chat.
+     * Opens a drawing room.
      */
     create(nickname: string): Promise<Channel>;
     /**
@@ -43,13 +43,18 @@ export class ChatNode {
      */
     endpoint_id(): string;
     /**
-     * Joins a chat.
+     * Joins a drawing room.
      */
     join(ticket: string, nickname: string): Promise<Channel>;
     /**
+     * Our current home relay URL, if known yet. Included in tickets so
+     * joiners can dial us without working discovery.
+     */
+    relay_url(): string | undefined;
+    /**
      * Spawns a gossip node.
      */
-    static spawn(): Promise<ChatNode>;
+    static spawn(): Promise<DrawNode>;
 }
 
 export class IntoUnderlyingByteSource {
