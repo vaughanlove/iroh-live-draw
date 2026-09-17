@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
 import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
-import { irohInit, irohJoin, irohPush, signPresence } from './iroh'
+import { irohInit, irohJoin, irohPush, peerCount, signPresence } from './iroh'
 import '@excalidraw/excalidraw/index.css'
 
 // navigator.clipboard needs HTTPS; plain-HTTP LAN (Android especially)
@@ -118,7 +118,7 @@ export default function App() {
       const s = stats.current
       const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
       setDbg(
-        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\ndialed: ${dialed.current.size} me: ${me.current.slice(0, 8)}`,
+        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\npeers: ${peerCount()} dialed: ${dialed.current.size} me: ${me.current.slice(0, 8)}`,
       )
     }, 500)
     return () => clearInterval(t)

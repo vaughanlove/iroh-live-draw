@@ -32,3 +32,8 @@ export function signPresence(msg: string): string {
   if (!sync) throw new Error('init first')
   return sync.sign_presence(msg)
 }
+
+export function peerCount(): number {
+  if (!sync) return -1
+  try { return sync.peer_count() } catch { return -2 }
+}

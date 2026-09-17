@@ -168,6 +168,11 @@ impl Sync {
         Ok(())
     }
 
+    /// Number of live outbound peer queues (diagnostics for the debug drawer).
+    pub fn peer_count(&self) -> usize {
+        self.txs.try_lock().map(|v| v.len()).unwrap_or(999)
+    }
+
     /// Enqueue a message for every connected peer (never blocks).
     /// Dead peers are pruned; per-peer pumps preserve send order.
     pub fn push(&self, snapshot: &str) {

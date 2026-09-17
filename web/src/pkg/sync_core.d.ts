@@ -56,6 +56,10 @@ export class Sync {
     join(peer: string, snapshot: string): Promise<void>;
     node_id(): string;
     /**
+     * Number of live outbound peer queues (diagnostics for the debug drawer).
+     */
+    peer_count(): number;
+    /**
      * Enqueue a message for every connected peer (never blocks).
      * Dead peers are pruned; per-peer pumps preserve send order.
      */
@@ -95,6 +99,7 @@ export interface InitOutput {
     readonly sync_create: (a: number, b: number, c: any) => any;
     readonly sync_join: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly sync_node_id: (a: number) => [number, number];
+    readonly sync_peer_count: (a: number) => number;
     readonly sync_push: (a: number, b: number, c: number) => void;
     readonly sync_secret_key: (a: number) => [number, number];
     readonly sync_sign_presence: (a: number, b: number, c: number) => [number, number];
@@ -102,9 +107,9 @@ export interface InitOutput {
     readonly wasm_bindgen__convert__closures_____invoke__h1be5897824ed5003: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7c8754fb4fccc717: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_21: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_22: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_23: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_24: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h9288e816a40a14d3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h11cb23aadc831bd3: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h6c0bb1e4740ecbfe: (a: number, b: number) => void;
