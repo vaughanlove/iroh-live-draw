@@ -25,23 +25,6 @@ export function irohPush(snapshot: string) {
   try { sync.push(snapshot) } catch {}
 }
 
-// --- gossip room (live patches + cursors). Snapshots stay direct. ---
-
-export function roomTopic(): string {
-  if (!sync) throw new Error('init first')
-  return Sync.room_topic()
-}
-
-export async function roomJoin(topicHex: string, addrs: string[]): Promise<void> {
-  if (!sync) throw new Error('init first')
-  await sync.room_join(topicHex, addrs)
-}
-
-export function roomPush(s: string) {
-  if (!sync) return
-  try { sync.room_push(s) } catch {}
-}
-
 export function signPresence(msg: string): string {
   if (!sync) throw new Error('init first')
   return sync.sign_presence(msg)

@@ -61,23 +61,6 @@ export class Sync {
      */
     push(snapshot: string): void;
     /**
-     * Join a gossip room: seeds relay hints from `addrs` (JS array of
-     * "<node-id> <relay-url>"), subscribes to the topic, and pumps received
-     * messages into the JS callback. Live patches/cursors go over the room;
-     * full snapshots stay on direct dials (see [`Sync::join`]).
-     */
-    room_join(topic_hex: string, addrs: any): Promise<void>;
-    /**
-     * Broadcast a message to the room (no-op if not joined).
-     */
-    room_push(s: string): void;
-    /**
-     * Push local snapshot to every connected peer (fire-and-forget).
-     * Dead streams are pruned.
-     * Fresh random room topic as hex (for share links).
-     */
-    static room_topic(): string;
-    /**
      * Secret key string — persist it; passing it back to `create` restores
      * this device's identity (same node id / addr across reloads).
      */
@@ -113,22 +96,19 @@ export interface InitOutput {
     readonly sync_join: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly sync_node_id: (a: number) => [number, number];
     readonly sync_push: (a: number, b: number, c: number) => void;
-    readonly sync_room_join: (a: number, b: number, c: number, d: any) => any;
-    readonly sync_room_push: (a: number, b: number, c: number) => void;
-    readonly sync_room_topic: () => [number, number, number, number];
     readonly sync_secret_key: (a: number) => [number, number];
     readonly sync_sign_presence: (a: number, b: number, c: number) => [number, number];
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h1be5897824ed5003: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7c8754fb4fccc717: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_21: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_22: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h137ae832b65df188_23: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h9288e816a40a14d3: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_24: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_25: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9ca60cb6418926d7_26: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h5ab1ec89429495ee: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hc3b0e800b5c166fa: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hfff20b4885a17646: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h11cb23aadc831bd3: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h6c0bb1e4740ecbfe: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hdd5ff820f7753c13: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

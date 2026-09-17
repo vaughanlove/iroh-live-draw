@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
 import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
-import { irohInit, irohJoin, irohPush, roomTopic, roomJoin, roomPush, signPresence } from './iroh'
+import { irohInit, irohJoin, irohPush, signPresence } from './iroh'
 import '@excalidraw/excalidraw/index.css'
 
 // navigator.clipboard needs HTTPS; plain-HTTP LAN (Android especially)
@@ -50,19 +50,16 @@ export default function App() {
   const timers = useRef<number[]>([])
   const me = useRef('')
   const seq = useRef(0)
-  const inRoom = useRef(false)
   const dialed = useRef<Set<string>>(new Set()) // presence auto-dial dedup
-  // fixed dev room: presence-discovered peers converge here without links
-  const DEV_TOPIC = 'fc0e92f0414e9f0cc1445177fec17336a2ca07396ae16334d1029f31540663e4'
   const lastSeq = useRef<Record<string, number>>({})
   const cursors = useRef<Record<string, PeerCursor>>({})
   const lastPtr = useRef(0)
 
+  // direct broadcast to every connected peer (localized neighborhood —
+  // no gossip layer). Per-sender sequence numbers drop the odd stale frame.
   const sendMsg = (obj: any) => {
     bump('sent', obj?.t ?? '?')
-    const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
-    if (inRoom.current) roomPush(s)
-    else irohPush(s)
+    irohPush(JSON.stringify({ from: me.current, seq: seq.current++, ...obj }))
   }
   const connect = async (addr: string) => {
     setStatus('connecting…')
@@ -121,7 +118,7 @@ export default function App() {
       const s = stats.current
       const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
       setDbg(
-        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\nroom: ${inRoom.current} dialed: ${dialed.current.size} me: ${me.current.slice(0, 8)}`,
+        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\ndialed: ${dialed.current.size} me: ${me.current.slice(0, 8)}`,
       )
     }, 500)
     return () => clearInterval(t)
@@ -154,20 +151,13 @@ export default function App() {
     a.updateScene({ collaborators: map as any })
   }
 
-  // init: identity, share-link autojoin (room + direct dial for snapshot)
+  // init: identity, share-link autojoin (direct dial for snapshot)
   useEffect(() => {
     irohInit((msg) => handleRef.current(msg)).then(async (a) => {
       setId(a)
       me.current = a.split(/\s/)[0]
       setStatus('ready')
-      const q = new URLSearchParams(location.hash.slice(1))
-      const viaTopic = q.get('t'), viaLink = q.get('p')
-      if (viaTopic) {
-        try {
-          await roomJoin(viaTopic, viaLink && viaLink !== a ? [viaLink] : [])
-          inRoom.current = true
-        } catch (e) { setStatus(`room failed: ${e}`) }
-      }
+      const viaLink = new URLSearchParams(location.hash.slice(1)).get('p')
       if (viaLink && viaLink !== a) connect(viaLink)
       // dev presence (Pages only): LAN/local origins serve static files with
       // no API, so don't even attempt — avoids console noise entirely.
@@ -186,15 +176,9 @@ export default function App() {
           if (!reg.ok) return false
           const peers: { nodeId: string; addr: string }[] = await (await fetch('/api/presence')).json()
           const fresh = peers.filter((p) => p?.nodeId && p.nodeId !== me.current && p.addr && !dialed.current.has(p.nodeId))
-          if (fresh.length) {
-            if (!inRoom.current) {
-              await roomJoin(DEV_TOPIC, fresh.map((p) => p.addr))
-              inRoom.current = true
-            }
-            for (const p of fresh) {
-              dialed.current.add(p.nodeId)
-              connect(p.addr)
-            }
+          for (const p of fresh) {
+            dialed.current.add(p.nodeId)
+            connect(p.addr)
           }
           return true
         } catch {}
@@ -256,15 +240,7 @@ export default function App() {
           </div>
         )}
         <div style={{ marginTop: 6 }}>
-          <button disabled={!id} style={btn} onClick={async () => {
-            try {
-              const t = roomTopic()
-              await roomJoin(t, [])
-              inRoom.current = true
-              await copyText(`${location.origin}${location.pathname}#t=${t}&p=${encodeURIComponent(id)}`)
-              setStatus('share link copied — send it')
-            } catch (e) { setStatus(`share failed: ${e}`) }
-          }}>⧉ share</button>
+          <button disabled={!id} style={btn} onClick={() => copyText(`${location.origin}${location.pathname}#p=${encodeURIComponent(id)}`).then(() => setStatus('share link copied — send it'))}>⧉ share</button>
           <button style={btn} onClick={() => {
             sendMsg({ t: 'snap-req' })
             setStatus('reloading board…')
