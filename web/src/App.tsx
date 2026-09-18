@@ -33,7 +33,7 @@ export default function App() {
   const [dbg, setDbg] = useState('')
   const [online, setOnline] = useState<Record<string, string>>({})
   // event stats: per-type counters + rolling throughput
-  const stats = useRef({ sent: {} as Record<string, number>, recv: {} as Record<string, number>, stale: 0, maxOut: 0 })
+  const stats = useRef({ sent: {} as Record<string, number>, recv: {} as Record<string, number>, stale: 0, maxOut: 0, poison: 0, lastErr: '' })
   const times = useRef<number[]>([])
   const bump = (dir: 'sent' | 'recv', t: string) => {
     const s = stats.current
@@ -48,6 +48,9 @@ export default function App() {
   const me = useRef('')
   const nick = useRef('')
   const seq = useRef(0)
+  // session epoch: restarts numbering whenever we (re)join, so receivers
+  // never mistake a fresh stream for stale frames of an old one
+  const epoch = useRef(Math.random().toString(36).slice(2))
   const lastSeq = useRef<Record<string, number>>({})
   const cursors = useRef<Record<string, PeerCursor>>({})
   const lastPtr = useRef(0)
@@ -57,7 +60,7 @@ export default function App() {
     const ch = chanRef.current
     if (!ch) return
     bump('sent', obj?.t ?? '?')
-    const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
+    const s = JSON.stringify({ from: me.current, epoch: epoch.current, seq: seq.current++, ...obj })
     if (s.length > stats.current.maxOut) stats.current.maxOut = s.length
     ch.sender.broadcast(s).catch(() => bump('sent', 'drop'))
   }
@@ -111,9 +114,12 @@ export default function App() {
         return
       }
       if (m?.t === 'p') {
-        if (typeof m.seq === 'number') {
-          if (m.seq <= (lastSeq.current[from] ?? -1)) { stats.current.stale++; return }
-          lastSeq.current[from] = m.seq
+        if (typeof m.seq === 'number' && m.from) {
+          // key includes the sender's epoch: a rejoin/restart begins a new
+          // stream instead of looking like impossibly stale frames
+          const key = `${m.from}:${m.epoch ?? 0}`
+          if (m.seq <= (lastSeq.current[key] ?? -1)) { stats.current.stale++; return }
+          lastSeq.current[key] = m.seq
         }
         if (Array.isArray(m.elements)) applyRemote(m.elements, false)
       } else if (m?.t === 'snap-req') {
@@ -125,28 +131,45 @@ export default function App() {
   }
 
   // join (or create) a room channel and pump its receiver stream.
+  // Fire-and-forget: the pump never resolves while the room is live, so
+  // callers must NOT await this (awaiting hangs everything after it).
   // Re-joining the same channel object is a no-op (its stream stays locked
   // to the original reader); a new channel abandons the old pump via gen.
   const pumpingFor = useRef<any>(null)
-  const joinChannel = async (ch: any) => {
-    const gen = ++roomGen.current
+  const joinChannel = (ch: any) => {
     chanRef.current = ch
     if (pumpingFor.current === ch) return
+    // generation rotates ONLY on a genuinely new pump — bumping it here
+    // unconditionally murders the running reader on every re-tap
+    const gen = ++roomGen.current
     pumpingFor.current = ch
-    const reader = (ch.receiver as ReadableStream).getReader()
+    // new room = new stream: rotate epoch so peers track us fresh
+    epoch.current = Math.random().toString(36).slice(2)
+    seq.current = 0
     setStatus('connected — draw!')
-    try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done || gen !== roomGen.current) break
-        onRoomEvent(value)
+    ;(async () => {
+      const reader = (ch.receiver as ReadableStream).getReader()
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done || gen !== roomGen.current) break
+          // Per-message guard: one poison message must never kill the pump
+          // (that deafens us to the whole room with zero errors surfaced).
+          try {
+            // bridge sends JSON strings (u64-safe); tolerate objects too
+            onRoomEvent(typeof value === 'string' ? JSON.parse(value) : value)
+          } catch (e) {
+            stats.current.poison++
+            stats.current.lastErr = String(e).slice(0, 120)
+          }
+        }
+      } catch {
+        /* stream closed */
+      } finally {
+        if (pumpingFor.current === ch) pumpingFor.current = null
+        try { reader.releaseLock() } catch {}
       }
-    } catch {
-      /* stream closed */
-    } finally {
-      if (pumpingFor.current === ch) pumpingFor.current = null
-      try { reader.releaseLock() } catch {}
-    }
+    })()
   }
 
   const pushCollaborators = () => {
@@ -181,7 +204,7 @@ export default function App() {
           setStatus('joining…')
           const ch = await node.join(ticket, nick.current)
           if (dead) return
-          await joinChannel(ch)
+          joinChannel(ch)
           sendMsg({ t: 'snap-req' })
         }
       } catch (e) {
@@ -213,7 +236,7 @@ export default function App() {
       const s = stats.current
       const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
       setDbg(
-        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale} maxOut: ${s.maxOut}B\nonline: ${Object.keys(onlineRef.current).length} me: ${me.current.slice(0, 8)}`,
+        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale: ${s.stale} poison: ${s.poison} maxOut: ${s.maxOut}B\nerr: ${s.lastErr}\nonline: ${Object.keys(onlineRef.current).length} me: ${me.current.slice(0, 8)}`,
       )
     }, 500)
     return () => clearInterval(t)
@@ -241,7 +264,7 @@ export default function App() {
     if (!node) return
     try {
       const ch = chanRef.current ?? (await node.create(nick.current))
-      await joinChannel(ch)
+      joinChannel(ch)
       const ticket = ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
       await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
       setStatus('share link copied — send it')
@@ -287,7 +310,7 @@ export default function App() {
               setStatus('joining…')
               try {
                 const ch = await nodeRef.current.join(peer.trim(), nick.current)
-                await joinChannel(ch)
+                joinChannel(ch)
                 sendMsg({ t: 'snap-req' })
               } catch (e) { setStatus(`join failed: ${e}`) }
             }}>join</button>

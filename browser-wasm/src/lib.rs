@@ -88,9 +88,18 @@ impl DrawNode {
                     _ => {}
                 }
             }
+            // Events cross as JSON strings, never live JsValues: serde-wasm-bindgen
+            // rejects u64 (sent_timestamp) and .unwrap() would kill the stream
+            // task on the first event, deafening the tab with no JS exception.
+            // (Micros timestamps fit exactly in a JS number, so this is safe.)
             event
-                .map_err(|err| JsValue::from(&err.to_string()))
-                .map(|event| serde_wasm_bindgen::to_value(&event).unwrap())
+                .map_err(|err| JsValue::from_str(&err.to_string()))
+                .map(|event| match serde_json::to_string(&event) {
+                    Ok(s) => JsValue::from_str(&s),
+                    Err(err) => JsValue::from_str(
+                        &serde_json::json!({"type": "error", "message": err.to_string()}).to_string(),
+                    ),
+                })
         });
         let receiver = ReadableStream::from_stream(receiver).into_raw();
 

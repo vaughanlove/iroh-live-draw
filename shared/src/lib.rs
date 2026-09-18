@@ -180,8 +180,10 @@ impl DrawNode {
                     let signed_message = SignedMessage::sign_and_encode(&secret_key, message)
                         .expect("failed to encode message");
                     if let Err(err) = sender.lock().await.broadcast(signed_message.into()).await {
-                        tracing::warn!("presence task failed to broadcast: {err}");
-                        break;
+                        // Never break here: a transient send failure must not
+                        // permanently silence presence (roster would lose us
+                        // while drawing keeps working). Retry next interval.
+                        tracing::warn!("presence broadcast failed, retrying: {err}");
                     }
                     n0_future::future::race(
                         n0_future::time::sleep(PRESENCE_INTERVAL),
