@@ -99,7 +99,11 @@ impl DrawNode {
         let lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(lookup.clone());
 
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        // Default gossip cap is 4KB and oversize sends fail silently —
+        // scenes need headroom. (Long-term: chunk snapshots instead.)
+        let gossip = Gossip::builder()
+            .max_message_size(1024 * 256)
+            .spawn(endpoint.clone());
         info!("gossip spawned");
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())
