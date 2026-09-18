@@ -10,8 +10,7 @@
     "@excalidraw/excalidraw": "^0.18.1",
     "react": "18",
     "react-dom": "18",
-    "tweetnacl": "^1.0.3",
-    "draw-browser": "file:src/pkg"
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/react": "^19.3.0",
