@@ -33,7 +33,7 @@ export default function App() {
   const [dbg, setDbg] = useState('')
   const [online, setOnline] = useState<Record<string, string>>({})
   // event stats: per-type counters + rolling throughput
-  const stats = useRef({ sent: {} as Record<string, number>, recv: {} as Record<string, number>, stale: 0 })
+  const stats = useRef({ sent: {} as Record<string, number>, recv: {} as Record<string, number>, stale: 0, maxOut: 0 })
   const times = useRef<number[]>([])
   const bump = (dir: 'sent' | 'recv', t: string) => {
     const s = stats.current
@@ -58,6 +58,7 @@ export default function App() {
     if (!ch) return
     bump('sent', obj?.t ?? '?')
     const s = JSON.stringify({ from: me.current, seq: seq.current++, ...obj })
+    if (s.length > stats.current.maxOut) stats.current.maxOut = s.length
     ch.sender.broadcast(s).catch(() => bump('sent', 'drop'))
   }
 
@@ -212,7 +213,7 @@ export default function App() {
       const s = stats.current
       const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v}`).join(' ') || '—'
       setDbg(
-        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale}\nonline: ${Object.keys(onlineRef.current).length} me: ${me.current.slice(0, 8)}`,
+        `eps=${(times.current.length / 2).toFixed(1)} (2s window)\nsent: ${fmt(s.sent)}\nrecv: ${fmt(s.recv)}\nstale dropped: ${s.stale} maxOut: ${s.maxOut}B\nonline: ${Object.keys(onlineRef.current).length} me: ${me.current.slice(0, 8)}`,
       )
     }, 500)
     return () => clearInterval(t)

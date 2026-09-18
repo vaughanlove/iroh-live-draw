@@ -6,10 +6,8 @@ use std::{
 use anyhow::{Context, Result};
 pub use iroh::EndpointId;
 pub use iroh::RelayUrl;
-use iroh::{
-    EndpointAddr, PublicKey, SecretKey, Signature, TransportAddr, protocol::Router,
-};
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::{EndpointAddr, PublicKey, SecretKey, Signature, TransportAddr, protocol::Router};
 pub use iroh_gossip::proto::TopicId;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
@@ -123,10 +121,15 @@ impl DrawNode {
     /// Our current home relay, if the endpoint has settled on one. Tickets
     /// carry this so joiners can dial us without discovery.
     pub fn relay_url(&self) -> Option<RelayUrl> {
-        self.router.endpoint().addr().addrs.iter().find_map(|a| match a {
-            TransportAddr::Relay(url) => Some(url.clone()),
-            _ => None,
-        })
+        self.router
+            .endpoint()
+            .addr()
+            .addrs
+            .iter()
+            .find_map(|a| match a {
+                TransportAddr::Relay(url) => Some(url.clone()),
+                _ => None,
+            })
     }
 
     /// Joins a chat channel from a ticket.
@@ -167,7 +170,7 @@ impl DrawNode {
 
             async move {
                 loop {
-                    let nickname = nickname.lock().expect("poisened").clone();
+                    let nickname = nickname.lock().expect("poisoned").clone();
                     let message = Message::Presence { nickname };
                     debug!("send presence {message:?}");
                     let signed_message = SignedMessage::sign_and_encode(&secret_key, message)
@@ -252,7 +255,7 @@ pub struct ChatSender {
 
 impl ChatSender {
     pub async fn send(&self, text: String) -> Result<()> {
-        let nickname = self.nickname.lock().expect("poisened").clone();
+        let nickname = self.nickname.lock().expect("poisoned").clone();
         let message = Message::Message { text, nickname };
         let signed_message = SignedMessage::sign_and_encode(&self.secret_key, message)?;
         self.sender
@@ -264,7 +267,7 @@ impl ChatSender {
     }
 
     pub fn set_nickname(&self, name: String) {
-        *self.nickname.lock().expect("poisened") = name;
+        *self.nickname.lock().expect("poisoned") = name;
         self.trigger_presence.notify_waiters();
     }
 }
