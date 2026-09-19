@@ -70,6 +70,13 @@ const loadPeers = (): Record<string, PeerInfo> => {
 }
 const savePeers = (p: Record<string, PeerInfo>) => localStorage.setItem(LS_PEERS, JSON.stringify(p))
 
+// Developer UI (debug drawer, save indicator, cache reset) is only shown
+// with `npm run dev` (VITE_DEBUG via .env.development) or `?debug=1`.
+// Production builds served to the iPad stay clean.
+const DEBUG =
+  (import.meta as any).env?.VITE_DEBUG === '1' ||
+  new URLSearchParams(location.search).has('debug')
+
 export default function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null)
   const [id, setId] = useState('')
@@ -473,7 +480,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // debug drawer data (rendered only when open; skipped entirely in prod)
   useEffect(() => {
+    if (!DEBUG) return
     const t = window.setInterval(() => {
       const now = Date.now()
       times.current = times.current.filter((ts) => now - ts < 2000)
@@ -639,17 +648,17 @@ export default function App() {
           }}>SVG</button>
         </div>
         <div style={{ opacity: 0.6, marginTop: 4, fontSize: 12 }}>{status}{activeDoc ? ` · ${activeDoc.name}` : ''}</div>
-        <div style={{ opacity: 0.6, marginTop: 2, fontSize: 12 }}>💾 {saveInfo}</div>
-        <button style={btn} onClick={() => setShowDbg((s) => !s)}>debug</button>
-        <button style={btn} onClick={() => {
+        {DEBUG && <div style={{ opacity: 0.6, marginTop: 2, fontSize: 12 }}>💾 {saveInfo}</div>}
+        {DEBUG && <button style={btn} onClick={() => setShowDbg((s) => !s)}>debug</button>}
+        {DEBUG && <button style={btn} onClick={() => {
           try {
             Object.keys(localStorage).filter((k) => k.startsWith('draw.')).forEach((k) => localStorage.removeItem(k))
             sessionStorage.removeItem('draw.tab')
           } catch {}
           location.hash = ''
           location.reload()
-        }}>clear cache</button>
-        {showDbg && (
+        }}>clear cache</button>}
+        {DEBUG && showDbg && (
           <pre style={{ fontSize: 10, fontFamily: 'monospace', background: '#0d0f16', color: '#9fe', borderRadius: 8, padding: 8, marginTop: 4, whiteSpace: 'pre-wrap' }}>{dbg}</pre>
         )}
       </div>
