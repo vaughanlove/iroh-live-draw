@@ -155,14 +155,44 @@ export default function App() {
     }
   }
 
+  // Inbound coalescing: drawing messages can arrive at pointer-move rate.
+  // Merge them and reconcile at most once per animation frame instead of
+  // once per message (each reconcile is O(scene) — this is what lags after
+  // ~10s of continuous strokes on a grown canvas).
+  const pendingRef = useRef<{ map: Map<string, any>; asIs: boolean } | null>(null)
+  const rafRef = useRef(0)
+  const flushPending = () => {
+    rafRef.current = 0
+    const p = pendingRef.current
+    pendingRef.current = null
+    if (!p) return
+    applyRemote([...p.map.values()], p.asIs)
+  }
+  const queueRemote = (elements: any[], asIs: boolean) => {
+    const p = asIs || !pendingRef.current
+      ? { map: new Map<string, any>(), asIs }
+      : pendingRef.current!
+    if (asIs) p.asIs = true
+    for (const el of elements) {
+      const prev = p.map.get(el.id)
+      if (!prev || (el.version ?? 0) >= (prev.version ?? 0)) p.map.set(el.id, el)
+    }
+    pendingRef.current = p
+    if (!rafRef.current) rafRef.current = requestAnimationFrame(flushPending)
+  }
+
   const refreshOwnerLive = () => {
+    setOwnerLive(ownerIsLive())
+  }
+
+  const ownerIsLive = () => {
     const aid = activeRef.current
-    if (!aid) { setOwnerLive(true); return }
+    if (!aid) return true
     const room = rooms.current.get(aid)
-    if (!room) { setOwnerLive(true); return }
-    if (!room.owner || room.owner === me.current) { setOwnerLive(true); return }
+    if (!room) return true
+    if (!room.owner || room.owner === me.current) return true
     const last = room.live.get(room.owner) ?? 0
-    setOwnerLive(Date.now() - last < 12000)
+    return Date.now() - last < 12000
   }
 
   const setPresence = (roomId: string, from: string, nickname: string, doc?: string | null) => {
@@ -220,11 +250,11 @@ export default function App() {
           if (m.seq <= (lastSeq.current[key] ?? -1)) { stats.current.stale++; return }
           lastSeq.current[key] = m.seq
         }
-        if (Array.isArray(m.elements)) applyRemote(m.elements, false)
+        if (Array.isArray(m.elements)) queueRemote(m.elements, false)
       } else if (m?.t === 'snap-req') {
         sendMsg({ t: 'snap', elements: apiRef.current?.getSceneElements() ?? [] })
       } else if (m?.t === 'snap') {
-        if (Array.isArray(m.elements)) applyRemote(m.elements, true)
+        if (Array.isArray(m.elements)) queueRemote(m.elements, true)
       }
     }
   }
@@ -290,7 +320,8 @@ export default function App() {
   }
 
   const switchDoc = (roomId: string) => {
-    // persist outgoing canvas
+    // flush outgoing edits + persist outgoing canvas
+    flushDirty()
     if (activeRef.current) persistSnapshot(activeRef.current)
     activeRef.current = roomId
     setActiveId(roomId)
@@ -420,6 +451,13 @@ export default function App() {
     return () => clearInterval(t)
   }, [])
 
+  // flush outbound drawing batches ~16/s
+  useEffect(() => {
+    const t = window.setInterval(flushDirty, 60)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // prune stale cursors + owner liveness
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -448,13 +486,32 @@ export default function App() {
     return () => clearInterval(t)
   }, [])
 
+  // Outbound batching: freedraw fires onChange at pointer-move rate with
+  // ever-growing element payloads. Accumulate latest-version-per-id and
+  // flush ~16/s instead of broadcasting every event (60ms keeps remote
+  // strokes looking smooth; inbound rAF coalescing handles the rest).
+  const dirtyRef = useRef(new Map<string, any>())
+  const flushDirty = () => {
+    if (!dirtyRef.current.size) return
+    if (!me.current || !activeCh()) return
+    if (!ownerIsLive()) return // owner offline → edits stop
+    const els = [...dirtyRef.current.values()]
+    dirtyRef.current.clear()
+    sendMsg({ t: 'p', elements: els })
+  }
+
   const onChange = (elements: readonly OrderedExcalidrawElement[]) => {
     if (remote.current || !me.current || !activeCh()) return
-    if (!ownerLive) return // owner offline → edits stop
-    const changed = elements.filter((el: any) => sentVersions.current[el.id] !== el.version)
-    if (!changed.length) return
-    for (const el of changed as any[]) sentVersions.current[el.id] = el.version
-    sendMsg({ t: 'p', elements: changed })
+    if (!ownerLive) return // owner offline → edits stop (flush rechecks live)
+    let touched = false
+    for (const el of elements as any[]) {
+      if (sentVersions.current[el.id] === el.version) continue
+      sentVersions.current[el.id] = el.version
+      const prev = dirtyRef.current.get(el.id)
+      if (!prev || el.version >= prev.version) dirtyRef.current.set(el.id, el)
+      touched = true
+    }
+    if (touched && dirtyRef.current.size > 200) flushDirty() // backpressure: huge burst flushes early
   }
 
   const onPointerUpdate = (payload: { pointer: { x: number; y: number } }) => {
