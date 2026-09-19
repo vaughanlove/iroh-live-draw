@@ -40,6 +40,19 @@ export class Channel {
         return v1;
     }
     /**
+     * Owner endpoint id (source of truth), if known.
+     * @returns {string | undefined}
+     */
+    owner() {
+        const ret = wasm.channel_owner(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]);
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
      * @returns {ReadableStream}
      */
     get receiver() {
@@ -106,6 +119,15 @@ export class ChannelSender {
         return ret;
     }
     /**
+     * Announce which doc (topic id) we currently have open.
+     * @param {string | null} [doc]
+     */
+    set_current_doc(doc) {
+        var ptr0 = isLikeNone(doc) ? 0 : passStringToWasm0(doc, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.channelsender_set_current_doc(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * @param {string} nickname
      */
     set_nickname(nickname) {
@@ -137,7 +159,7 @@ export class DrawNode {
         wasm.__wbg_drawnode_free(ptr, 0);
     }
     /**
-     * Opens a drawing room.
+     * Opens a drawing room. Caller becomes the owner (source of truth).
      * @param {string} nickname
      * @returns {Promise<Channel>}
      */
@@ -192,11 +214,41 @@ export class DrawNode {
         return v1;
     }
     /**
-     * Spawns a gossip node.
+     * Secret key string — persist it; passing it back to `spawn_with_key`
+     * restores this device's identity.
+     * @returns {string}
+     */
+    secret_key() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.drawnode_secret_key(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Spawns a gossip node with an ephemeral identity.
      * @returns {Promise<DrawNode>}
      */
     static spawn() {
         const ret = wasm.drawnode_spawn();
+        return ret;
+    }
+    /**
+     * Spawns a gossip node with a stable identity.
+     * Pass back the string from `secret_key()` (stored e.g. in localStorage)
+     * to keep the same endpoint id across reloads.
+     * @param {string | null} [existing]
+     * @returns {Promise<DrawNode>}
+     */
+    static spawn_with_key(existing) {
+        var ptr0 = isLikeNone(existing) ? 0 : passStringToWasm0(existing, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        const ret = wasm.drawnode_spawn_with_key(ptr0, len0);
         return ret;
     }
 }
@@ -918,42 +970,42 @@ export function __wbg_wasClean_a32ef5f1fd90161e(arg0) {
     return ret;
 }
 export function __wbindgen_generic_0000000000000001(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2985, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2991, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb524c411cc4612b6);
     return ret;
 }
 export function __wbindgen_generic_0000000000000002(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4944, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4950, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4c9b27a236c12df4);
     return ret;
 }
 export function __wbindgen_generic_0000000000000003(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1711, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1717, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1c3399259ee45d8a);
     return ret;
 }
 export function __wbindgen_generic_0000000000000004(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3648, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3654, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h79bd56fd0616473d);
     return ret;
 }
 export function __wbindgen_generic_0000000000000005(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 2950, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 2956, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23f7e27b78ef2f58);
     return ret;
 }
 export function __wbindgen_generic_0000000000000006(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3185, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3191, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1b297369af64787e);
     return ret;
 }
 export function __wbindgen_generic_0000000000000007(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3209, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3215, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
     const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__he0976379ed5281ba);
     return ret;
 }
 export function __wbindgen_generic_0000000000000008(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 4915, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 4921, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h46f28b73f3eb178c);
     return ret;
 }

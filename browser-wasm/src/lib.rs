@@ -37,12 +37,34 @@ pub struct DrawNode(SharedNode);
 
 #[wasm_bindgen]
 impl DrawNode {
-    /// Spawns a gossip node.
+    /// Spawns a gossip node with an ephemeral identity.
     pub async fn spawn() -> Result<Self, JsError> {
-        let inner = SharedNode::spawn(None)
-            .await
-            .map_err(to_js_err)?;
+        Self::spawn_with_key(None).await
+    }
+
+    /// Spawns a gossip node with a stable identity.
+    /// Pass back the string from `secret_key()` (stored e.g. in localStorage)
+    /// to keep the same endpoint id across reloads.
+    pub async fn spawn_with_key(existing: Option<String>) -> Result<Self, JsError> {
+        let key = match existing {
+            Some(s) => {
+                let bytes = hex::decode(s.trim())
+                    .map_err(|e| JsError::new(&format!("bad secret key: {e}")))?;
+                let arr: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| JsError::new("bad secret key: expected 32 bytes hex"))?;
+                Some(draw_shared::SecretKey::from_bytes(&arr))
+            }
+            None => None,
+        };
+        let inner = SharedNode::spawn(key).await.map_err(to_js_err)?;
         Ok(Self(inner))
+    }
+
+    /// Secret key string — persist it; passing it back to `spawn_with_key`
+    /// restores this device's identity.
+    pub fn secret_key(&self) -> String {
+        hex::encode(self.0.secret_key().to_bytes())
     }
 
     /// Returns the endpoint id of this node.
@@ -56,9 +78,10 @@ impl DrawNode {
         self.0.relay_url().map(|u| u.to_string())
     }
 
-    /// Opens a drawing room.
+    /// Opens a drawing room. Caller becomes the owner (source of truth).
     pub async fn create(&self, nickname: String) -> Result<Channel, JsError> {
-        let ticket = DrawTicket::new_random();
+        let mut ticket = DrawTicket::new_random();
+        ticket.owner = Some(self.0.endpoint_id());
         self.join_inner(ticket, nickname).await
     }
 
@@ -116,6 +139,7 @@ impl DrawNode {
 
         let topic = Channel {
             topic_id: ticket.topic_id,
+            owner: ticket.owner,
             bootstrap: ticket.bootstrap,
             relays,
             neighbors,
@@ -132,6 +156,7 @@ type ChannelReceiver = wasm_streams::readable::sys::ReadableStream;
 #[wasm_bindgen]
 pub struct Channel {
     topic_id: TopicId,
+    owner: Option<EndpointId>,
     me: EndpointId,
     bootstrap: BTreeSet<EndpointId>,
     relays: BTreeMap<EndpointId, RelayUrl>,
@@ -155,6 +180,7 @@ impl Channel {
     pub fn ticket(&self, opts: JsValue) -> Result<String, JsError> {
         let opts: TicketOpts = serde_wasm_bindgen::from_value(opts)?;
         let mut ticket = DrawTicket::new(self.topic_id);
+        ticket.owner = self.owner;
         // Only include relay hints we actually have; bare IDs ride along
         // unresolved (same as before) rather than blocking the ticket.
         let mut include = Vec::new();
@@ -180,6 +206,11 @@ impl Channel {
 
     pub fn id(&self) -> String {
         self.topic_id.to_string()
+    }
+
+    /// Owner endpoint id (source of truth), if known.
+    pub fn owner(&self) -> Option<String> {
+        self.owner.as_ref().map(|o| o.to_string())
     }
 
     pub fn neighbors(&self) -> Vec<String> {
@@ -220,6 +251,11 @@ impl ChannelSender {
 
     pub fn set_nickname(&self, nickname: String) {
         self.0.set_nickname(nickname);
+    }
+
+    /// Announce which doc (topic id) we currently have open.
+    pub fn set_current_doc(&self, doc: Option<String>) {
+        self.0.set_current_doc(doc);
     }
 }
 

@@ -14,6 +14,10 @@ export class Channel {
     [Symbol.dispose](): void;
     id(): string;
     neighbors(): string[];
+    /**
+     * Owner endpoint id (source of truth), if known.
+     */
+    owner(): string | undefined;
     ticket(opts: any): string;
     readonly receiver: ReadableStream;
     readonly sender: ChannelSender;
@@ -24,6 +28,10 @@ export class ChannelSender {
     free(): void;
     [Symbol.dispose](): void;
     broadcast(text: string): Promise<void>;
+    /**
+     * Announce which doc (topic id) we currently have open.
+     */
+    set_current_doc(doc?: string | null): void;
     set_nickname(nickname: string): void;
 }
 
@@ -35,7 +43,7 @@ export class DrawNode {
     free(): void;
     [Symbol.dispose](): void;
     /**
-     * Opens a drawing room.
+     * Opens a drawing room. Caller becomes the owner (source of truth).
      */
     create(nickname: string): Promise<Channel>;
     /**
@@ -52,9 +60,20 @@ export class DrawNode {
      */
     relay_url(): string | undefined;
     /**
-     * Spawns a gossip node.
+     * Secret key string — persist it; passing it back to `spawn_with_key`
+     * restores this device's identity.
+     */
+    secret_key(): string;
+    /**
+     * Spawns a gossip node with an ephemeral identity.
      */
     static spawn(): Promise<DrawNode>;
+    /**
+     * Spawns a gossip node with a stable identity.
+     * Pass back the string from `secret_key()` (stored e.g. in localStorage)
+     * to keep the same endpoint id across reloads.
+     */
+    static spawn_with_key(existing?: string | null): Promise<DrawNode>;
 }
 
 export class IntoUnderlyingByteSource {

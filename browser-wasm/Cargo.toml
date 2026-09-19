@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1.0.86"
 draw-shared = { path = "../shared" }
+hex = "0.4"
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 n0-future = "0.3"

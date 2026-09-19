@@ -5,9 +5,9 @@ use std::{
 
 use anyhow::{Context, Result};
 pub use iroh::EndpointId;
-pub use iroh::RelayUrl;
+pub use iroh::{RelayUrl, SecretKey};
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::{EndpointAddr, PublicKey, SecretKey, Signature, TransportAddr, protocol::Router};
+use iroh::{EndpointAddr, PublicKey, Signature, TransportAddr, protocol::Router};
 pub use iroh_gossip::proto::TopicId;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
@@ -34,6 +34,11 @@ pub struct DrawTicket {
     /// Known relay homes, so joiners can dial without working discovery
     /// (browsers can't resolve bare IDs). Absent entries ride unresolved.
     pub relays: BTreeMap<EndpointId, RelayUrl>,
+    /// Owner holds the source of truth for this doc. Anyone may write while
+    /// the owner is live; when the owner is offline edits stop.
+    /// `None` on old tickets → treated as unknown owner.
+    #[serde(default)]
+    pub owner: Option<EndpointId>,
 }
 
 impl DrawTicket {
@@ -48,6 +53,7 @@ impl DrawTicket {
             topic_id,
             bootstrap: Default::default(), // an empty set
             relays: Default::default(),
+            owner: None,
         }
     }
     pub fn deserialize(input: &str) -> Result<Self> {
@@ -66,8 +72,24 @@ impl Ticket for DrawTicket {
     }
 
     fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
-        let ticket = postcard::from_bytes(bytes)?;
-        Ok(ticket)
+        // postcard is positional: tickets minted before `owner` existed
+        // can't decode as the new struct, so fall back to the legacy shape.
+        if let Ok(ticket) = postcard::from_bytes::<Self>(bytes) {
+            return Ok(ticket);
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyTicket {
+            topic_id: TopicId,
+            bootstrap: BTreeSet<EndpointId>,
+            relays: BTreeMap<EndpointId, RelayUrl>,
+        }
+        let legacy = postcard::from_bytes::<LegacyTicket>(bytes)?;
+        Ok(Self {
+            topic_id: legacy.topic_id,
+            bootstrap: legacy.bootstrap,
+            relays: legacy.relays,
+            owner: None,
+        })
     }
 }
 
@@ -122,6 +144,11 @@ impl DrawNode {
         self.router.endpoint().id()
     }
 
+    /// Secret key for stable identity (persist out-of-band, e.g. localStorage).
+    pub fn secret_key(&self) -> SecretKey {
+        self.secret_key.clone()
+    }
+
     /// Our current home relay, if the endpoint has settled on one. Tickets
     /// carry this so joiners can dial us without discovery.
     pub fn relay_url(&self) -> Option<RelayUrl> {
@@ -161,21 +188,26 @@ impl DrawNode {
         let (sender, receiver) = gossip_topic.split();
 
         let nickname = Arc::new(Mutex::new(nickname));
+        let current_doc: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let trigger_presence = Arc::new(Notify::new());
 
         // We spawn a task that occasionally sens a Presence message with our nickname.
         // This allows to track which peers are online currently.
+        // Presence also carries the doc (topic) we currently have open so
+        // peers we have directly connected to can show a live roster.
         let sender = Arc::new(TokioMutex::new(sender));
         let presence_task = AbortOnDropHandle::new(task::spawn({
             let secret_key = self.secret_key.clone();
             let sender = sender.clone();
             let trigger_presence = trigger_presence.clone();
             let nickname = nickname.clone();
+            let current_doc = current_doc.clone();
 
             async move {
                 loop {
                     let nickname = nickname.lock().expect("poisoned").clone();
-                    let message = Message::Presence { nickname };
+                    let doc = current_doc.lock().expect("poisoned").clone();
+                    let message = Message::Presence { nickname, doc };
                     debug!("send presence {message:?}");
                     let signed_message = SignedMessage::sign_and_encode(&secret_key, message)
                         .expect("failed to encode message");
@@ -235,6 +267,7 @@ impl DrawNode {
         let sender = ChatSender {
             secret_key: self.secret_key.clone(),
             nickname,
+            current_doc,
             sender,
             trigger_presence,
             _presence_task: Arc::new(presence_task),
@@ -253,6 +286,7 @@ impl DrawNode {
 #[derive(Debug, Clone)]
 pub struct ChatSender {
     nickname: Arc<Mutex<String>>,
+    current_doc: Arc<Mutex<Option<String>>>,
     secret_key: SecretKey,
     sender: Arc<TokioMutex<GossipSender>>,
     trigger_presence: Arc<Notify>,
@@ -276,6 +310,13 @@ impl ChatSender {
         *self.nickname.lock().expect("poisoned") = name;
         self.trigger_presence.notify_waiters();
     }
+
+    /// Announce which doc (topic id string) we currently have open.
+    /// FUTURE: fork/duplication can record parent linkage here.
+    pub fn set_current_doc(&self, doc: Option<String>) {
+        *self.current_doc.lock().expect("poisoned") = doc;
+        self.trigger_presence.notify_waiters();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +337,8 @@ pub enum Event {
     Presence {
         from: EndpointId,
         nickname: String,
+        #[serde(default)]
+        doc: Option<String>,
         sent_timestamp: u64,
     },
     #[serde(rename_all = "camelCase")]
@@ -319,9 +362,10 @@ impl TryFrom<GossipEvent> for Event {
                 let message = SignedMessage::verify_and_decode(&message.content)
                     .context("failed to parse and verify signed message")?;
                 match message.message {
-                    Message::Presence { nickname } => Self::Presence {
+                    Message::Presence { nickname, doc } => Self::Presence {
                         from: message.from,
                         nickname,
+                        doc,
                         sent_timestamp: message.timestamp,
                     },
                     Message::Message { text, nickname } => Self::MessageReceived {
@@ -385,7 +429,11 @@ pub enum WireMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
-    Presence { nickname: String },
+    Presence {
+        nickname: String,
+        #[serde(default)]
+        doc: Option<String>,
+    },
     Message { text: String, nickname: String },
 }
 
