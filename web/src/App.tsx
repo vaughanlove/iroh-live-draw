@@ -21,13 +21,34 @@ async function copyText(t: string) {
 }
 
 type PeerCursor = { x: number; y: number; at: number }
-type DocMeta = { id: string; owner: string | null; name: string; ticket?: string; updatedAt: number }
+// A doc is an overarching topic. It owns pages in three formats:
+// board (freeform), letter (formal, fixed geometry), daily (dated letters).
+type PageKind = 'board' | 'letter' | 'daily'
+type FormatTab = 'board' | 'letters' | 'daily'
+type PageMeta = { id: string; name: string; kind: PageKind; createdAt: number; updatedAt: number }
+type DocMeta = { id: string; owner: string | null; name: string; ticket?: string; updatedAt: number; pages: PageMeta[] }
 type PeerInfo = { nick: string; lastSeen: number; doc?: string | null }
 
 const LS_SECRET = 'draw.secret'
 const LS_DOCS = 'draw.docs'
 const LS_PEERS = 'draw.peers'
+const LS_PAGE = 'draw.activepage'
 const SS_TAB = 'draw.tab'
+
+// US Letter at 96dpi — the writing surface for letter pages.
+const LETTER_W = 816
+const LETTER_H = 1056
+
+const newPageId = () => 'pg' + Math.random().toString(36).slice(2, 10)
+const mainPage = (): PageMeta => ({ id: 'main', name: 'Board', kind: 'board', createdAt: 0, updatedAt: 0 })
+const todayName = () => new Date().toISOString().slice(0, 10)
+// Format tabs group pages: board | letters (formal pieces) | daily (dated).
+const formatOf = (p: PageMeta): FormatTab =>
+  p.kind === 'board' ? 'board' : p.kind === 'daily' ? 'daily' : 'letters'
+const isLetterKind = (k: PageKind) => k !== 'board'
+const snapKey = (doc: string, page: string) => `draw.snap.${doc}.${page}`
+const filesKey = (doc: string, page: string) => `draw.files.${doc}.${page}`
+const legacySnapKey = (doc: string) => `draw.snap.${doc}`
 
 // Identity: stable per browser (localStorage) but derived per tab
 // (sessionStorage), so two tabs in the same browser get distinct endpoint
@@ -62,7 +83,31 @@ const tabSecretHex = (): string => {
 }
 
 const loadDocs = (): DocMeta[] => {
-  try { return JSON.parse(localStorage.getItem(LS_DOCS) ?? '[]') } catch { return [] }
+  let docs: DocMeta[] = []
+  try { docs = JSON.parse(localStorage.getItem(LS_DOCS) ?? '[]') } catch { return [] }
+  // Migrate: docs predate pages; give each a default board page and move
+  // its snapshot under the new per-page key. Docs predate kinds too.
+  let migrated = false
+  for (const d of docs) {
+    if (!d.pages || !d.pages.length) {
+      d.pages = [mainPage()]
+      try {
+        const raw = localStorage.getItem(legacySnapKey(d.id))
+        if (raw) {
+          localStorage.setItem(snapKey(d.id, 'main'), raw)
+          localStorage.removeItem(legacySnapKey(d.id))
+          const fraw = localStorage.getItem(`draw.files.${d.id}`)
+          if (fraw) {
+            localStorage.setItem(filesKey(d.id, 'main'), fraw)
+            localStorage.removeItem(`draw.files.${d.id}`)
+          }
+        }
+      } catch {}
+      migrated = true
+    }
+  }
+  if (migrated) { try { localStorage.setItem(LS_DOCS, JSON.stringify(docs)) } catch {} }
+  return docs
 }
 const saveDocs = (d: DocMeta[]) => localStorage.setItem(LS_DOCS, JSON.stringify(d))
 const loadPeers = (): Record<string, PeerInfo> => {
@@ -89,6 +134,8 @@ export default function App() {
   const [peers, setPeers] = useState<Record<string, PeerInfo>>(() => loadPeers())
   const [docs, setDocs] = useState<DocMeta[]>(() => loadDocs())
   const [activeId, setActiveId] = useState<string | null>(null)
+  const [activePage, setActivePage] = useState<string | null>(null)
+  const [activeFormat, setActiveFormat] = useState<FormatTab>('board')
   const [ownerLive, setOwnerLive] = useState(true)
   const [saveInfo, setSaveInfo] = useState('not saved yet')
 
@@ -115,8 +162,36 @@ export default function App() {
   // docId -> { ch, owner, live:Set<peerId> }
   const rooms = useRef(new Map<string, { ch: any; owner: string | null; live: Map<string, number> }>())
   const activeRef = useRef<string | null>(null)
+  const activePageRef = useRef<string | null>(null)
+  const activeFormatRef = useRef<FormatTab>('board')
   const docsRef = useRef<DocMeta[]>(loadDocs())
   const sentVersions = useRef<Record<string, number>>({})
+
+  const activeDocPages = (): PageMeta[] =>
+    docsRef.current.find((d) => d.id === activeRef.current)?.pages ?? []
+  const setActivePageBoth = (docId: string, pageId: string) => {
+    activePageRef.current = pageId
+    setActivePage(pageId)
+    try { localStorage.setItem(`${LS_PAGE}.${docId}`, pageId) } catch {}
+    const pg = docsRef.current.find((d) => d.id === docId)?.pages.find((p) => p.id === pageId)
+    if (pg) {
+      const f = formatOf(pg)
+      activeFormatRef.current = f
+      setActiveFormat(f)
+    }
+  }
+  const storedActivePage = (docId: string): string | null => {
+    try { return localStorage.getItem(`${LS_PAGE}.${docId}`) } catch { return null }
+  }
+  // Presence announces "docId#pageId" in the shared doc string (no wire
+  // change: the Rust side carries it opaquely).
+  const presenceDoc = () => `${activeRef.current ?? ''}#${activePageRef.current ?? 'main'}`
+  const parsePresenceDoc = (s: string | null | undefined): { doc: string; page: string | null } => {
+    if (!s) return { doc: '', page: null }
+    const i = s.indexOf('#')
+    if (i < 0) return { doc: s, page: null }
+    return { doc: s.slice(0, i), page: s.slice(i + 1) || null }
+  }
 
   const setDocsBoth = (d: DocMeta[]) => {
     docsRef.current = d
@@ -141,9 +216,31 @@ export default function App() {
     const ch = activeCh()
     if (!ch) return
     bump('sent', obj?.t ?? '?')
-    const s = JSON.stringify({ from: me.current, epoch: epoch.current, seq: seq.current++, ...obj })
+    const s = JSON.stringify({ from: me.current, epoch: epoch.current, seq: seq.current++, page: activePageRef.current ?? 'main', ...obj })
     if (s.length > stats.current.maxOut) stats.current.maxOut = s.length
     ch.sender.broadcast(s).catch(() => bump('sent', 'drop'))
+  }
+
+  // Merge elements into a background page's stored snapshot (id-merge,
+  // version wins) so pages you're not viewing still converge.
+  const mergePageSnapshot = (docId: string, page: string, elements: any[], files: any[]) => {
+    try {
+      if (Array.isArray(files) && files.length) {
+        const fraw = localStorage.getItem(filesKey(docId, page))
+        const fmap = fraw ? JSON.parse(fraw) : {}
+        for (const f of files) if (f?.id) fmap[f.id] = f
+        try { localStorage.setItem(filesKey(docId, page), JSON.stringify(fmap)) } catch {}
+      }
+      const raw = localStorage.getItem(snapKey(docId, page))
+      const cur = raw ? JSON.parse(raw) : []
+      const map = new Map<string, any>()
+      if (Array.isArray(cur)) for (const el of cur) map.set(el.id, el)
+      for (const el of elements) {
+        const prev = map.get(el.id)
+        if (!prev || (el.version ?? 0) >= (prev.version ?? 0)) map.set(el.id, el)
+      }
+      localStorage.setItem(snapKey(docId, page), JSON.stringify([...map.values()]))
+    } catch {}
   }
 
   const applyRemote = (elements: any[], asIs: boolean) => {
@@ -245,10 +342,23 @@ export default function App() {
       const from = String(ev.from ?? m.from ?? '')
       if (from === me.current) return
       // Ignore drawing traffic for background rooms (still track presence)
-      if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'cursor')) return
+      if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'f' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'cursor' || m?.t === 'pages')) return
+      // Page tag (absent = legacy client on the default page).
+      const msgPage = typeof m.page === 'string' ? m.page : 'main'
+      const isActivePage = msgPage === (activePageRef.current ?? 'main')
       if (m?.t === 'cursor') {
+        if (!isActivePage) return
         cursors.current[from] = { x: m.x, y: m.y, at: Date.now() }
         pushCollaborators()
+        return
+      }
+      if (m?.t === 'pages') {
+        mergePages(roomId, m.pages)
+        return
+      }
+      if (m?.t === 'f') {
+        if (isActivePage) ingestFiles(m.files)
+        else mergePageSnapshot(roomId, msgPage, [], m.files ?? [])
         return
       }
       if (m?.t === 'p') {
@@ -257,11 +367,48 @@ export default function App() {
           if (m.seq <= (lastSeq.current[key] ?? -1)) { stats.current.stale++; return }
           lastSeq.current[key] = m.seq
         }
-        if (Array.isArray(m.elements)) queueRemote(m.elements, false)
+        if (isActivePage) {
+          if (Array.isArray(m.files)) ingestFiles(m.files)
+          if (Array.isArray(m.elements)) queueRemote(m.elements, false)
+        } else if (Array.isArray(m.elements)) {
+          mergePageSnapshot(roomId, msgPage, m.elements, m.files ?? [])
+        }
       } else if (m?.t === 'snap-req') {
-        sendMsg({ t: 'snap', elements: apiRef.current?.getSceneElements() ?? [] })
+        // Answer with elements + their binaries (forced: the requester is
+        // usually a newcomer who missed the original file broadcasts).
+        // Honors the requested page; falls back to our active page.
+        const want = typeof m.page === 'string' && m.page !== (activePageRef.current ?? 'main') ? m.page : null
+        let els: any[]
+        let files: any[]
+        if (want) {
+          try {
+            const raw = localStorage.getItem(snapKey(roomId, want))
+            els = raw ? JSON.parse(raw) : []
+          } catch { els = [] }
+          try {
+            const fraw = localStorage.getItem(filesKey(roomId, want))
+            files = Object.values(fraw ? JSON.parse(fraw) : {})
+          } catch { files = [] }
+        } else {
+          els = apiRef.current?.getSceneElements() ?? []
+          files = collectFilesFor(els, true)
+        }
+        if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
+          sendMsg({ t: 'snap', elements: els, files, page: want ?? activePageRef.current ?? 'main' })
+        } else {
+          sendMsg({ t: 'snap', elements: els, page: want ?? activePageRef.current ?? 'main' })
+          for (const f of files) {
+            if (JSON.stringify(f).length > MAX_MSG) continue
+            sendMsg({ t: 'f', files: [f], page: want ?? activePageRef.current ?? 'main' })
+          }
+        }
       } else if (m?.t === 'snap') {
-        if (Array.isArray(m.elements)) queueRemote(m.elements, true)
+        if (isActivePage) {
+          if (Array.isArray(m.files)) ingestFiles(m.files)
+          if (Array.isArray(m.elements)) queueRemote(m.elements, true)
+        } else if (Array.isArray(m.elements)) {
+          mergePageSnapshot(roomId, msgPage, m.elements, m.files ?? [])
+        }
       }
     }
   }
@@ -286,10 +433,11 @@ export default function App() {
     })()
   }
 
-  const persistSnapshot = (roomId: string) => {
+  const persistSnapshot = (roomId: string, page?: string) => {
+    const pg = page ?? activePageRef.current ?? 'main'
     try {
       const els = apiRef.current?.getSceneElements() ?? []
-      const key = `draw.snap.${roomId}`
+      const key = snapKey(roomId, pg)
       // Never let a blank canvas destroy a non-empty snapshot. Tabs share
       // one localStorage, so an idle/empty tab would otherwise wipe the
       // drawing tab's snapshot within 3s. (Trade-off: wiping the canvas
@@ -300,6 +448,16 @@ export default function App() {
         if (raw && raw !== '[]') { setSaveInfo(`held snapshot ${new Date().toLocaleTimeString()} (canvas empty)`); return }
       }
       localStorage.setItem(key, JSON.stringify(els))
+      // Persist image binaries alongside (best-effort: quota may refuse).
+      try {
+        const files = apiRef.current?.getFiles() ?? {}
+        const needed: Record<string, any> = {}
+        for (const el of els as any[]) {
+          const fid = el?.fileId
+          if (fid && files[fid]) needed[fid] = files[fid]
+        }
+        localStorage.setItem(filesKey(roomId, pg), JSON.stringify(needed))
+      } catch {}
       const verify = localStorage.getItem(key)
       setSaveInfo(`saved ${els.length} els ${new Date().toLocaleTimeString()} (${(verify ?? '').length}B)`)
     } catch (e) {
@@ -309,21 +467,74 @@ export default function App() {
 
   // Restore a doc's snapshot into the canvas. Safe to call before the
   // Excalidraw api is ready — it no-ops and the api setter retries.
-  const applyStoredSnapshot = (roomId: string) => {
+  const applyStoredSnapshot = (roomId: string, page?: string) => {
+    const pg = page ?? activePageRef.current ?? 'main'
     if (!apiRef.current) { setSaveInfo('restore deferred (no api yet)'); return }
     try {
-      const raw = localStorage.getItem(`draw.snap.${roomId}`)
+      // Binaries first, so image elements resolve instead of placeholdering.
+      try {
+        const fraw = localStorage.getItem(filesKey(roomId, pg))
+        const fmap = fraw ? JSON.parse(fraw) : {}
+        const arr = Object.values(fmap)
+        if (arr.length) {
+          apiRef.current.addFiles(arr as any)
+          for (const f of arr as any[]) if (f?.id) sentFiles.current.add(f.id)
+        }
+      } catch {}
+      const raw = localStorage.getItem(snapKey(roomId, pg))
       const els = raw ? JSON.parse(raw) : []
       if (Array.isArray(els)) {
         remote.current = true
         try { apiRef.current.updateScene({ elements: els, commitToHistory: false }) } finally { remote.current = false }
         for (const el of apiRef.current.getSceneElements()) sentVersions.current[el.id] = el.version
-        restored.current.add(roomId)
+        restored.current.add(`${roomId}/${pg}`)
         setSaveInfo(`restored ${els.length} els ${new Date().toLocaleTimeString()}`)
       }
     } catch (e) {
       setSaveInfo(`restore FAILED: ${String(e).slice(0, 80)}`)
     }
+  }
+
+  // Merge a remote page list: adopt unknown pages (LWW on updatedAt),
+  // then pull any adopted page's content from the owner.
+  const mergePages = (roomId: string, remotePages: PageMeta[]) => {
+    if (!Array.isArray(remotePages) || !remotePages.length) return
+    const docs = [...docsRef.current]
+    const doc = docs.find((d) => d.id === roomId)
+    if (!doc) return
+    let changed = false
+    for (const rp of remotePages) {
+      if (!rp || typeof rp.id !== 'string') continue
+      const local = doc.pages.find((p) => p.id === rp.id)
+      const rkind: PageKind = rp.kind === 'letter' || rp.kind === 'daily' ? rp.kind : 'board'
+      if (!local) {
+        doc.pages.push({
+          id: rp.id,
+          name: typeof rp.name === 'string' ? rp.name : rp.id,
+          kind: rkind,
+          createdAt: rp.createdAt ?? Date.now(),
+          updatedAt: rp.updatedAt ?? Date.now(),
+        })
+        changed = true
+        // pull the adopted page's content (goes to stored snapshot if
+        // we're not viewing it)
+        if (roomId === activeRef.current && rp.id === activePageRef.current) sendMsg({ t: 'snap-req' })
+      } else if ((rp.updatedAt ?? 0) > (local.updatedAt ?? 0)) {
+        local.name = typeof rp.name === 'string' ? rp.name : local.name
+        local.kind = rkind
+        local.updatedAt = rp.updatedAt
+        changed = true
+      }
+    }
+    if (changed) {
+      doc.pages.sort((a, b) => a.createdAt - b.createdAt)
+      setDocsBoth(docs)
+    }
+  }
+
+  const broadcastPages = () => {
+    const doc = docsRef.current.find((d) => d.id === activeRef.current)
+    if (doc) sendMsg({ t: 'pages', pages: doc.pages })
   }
 
   const switchDoc = (roomId: string) => {
@@ -336,16 +547,117 @@ export default function App() {
     setOnline({})
     cursors.current = {}
     sentVersions.current = {}
+    sentFiles.current = new Set()
+    dirtyFilesRef.current.clear()
+    // restore this doc's last-viewed page (or its first page)
+    const doc = docsRef.current.find((d) => d.id === roomId)
+    const pages = doc?.pages?.length ? doc.pages : [mainPage()]
+    const want = storedActivePage(roomId)
+    const pg = pages.some((p) => p.id === want) ? want! : pages[0].id
+    setActivePageBoth(roomId, pg)
     // load incoming snapshot (deferred until api ready if needed)
-    applyStoredSnapshot(roomId)
+    applyStoredSnapshot(roomId, pg)
+    ensureLetterSurface(roomId, pg)
     epoch.current = Math.random().toString(36).slice(2)
     seq.current = 0
-    // announce which doc we have open on every live room sender
+    // announce which doc+page we have open on every live room sender
     for (const [, r] of rooms.current) {
-      try { r.ch.sender.set_current_doc?.(roomId) } catch {}
+      try { r.ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     }
     setStatus('connected — draw!')
     refreshOwnerLive()
+    sendMsg({ t: 'snap-req' })
+  }
+
+  const switchPage = (pageId: string) => {
+    const roomId = activeRef.current
+    if (!roomId || pageId === activePageRef.current) return
+    flushDirty()
+    persistSnapshot(roomId)
+    activePageRef.current = null // park: outgoing persist/announce use explicit ids below
+    cursors.current = {}
+    sentVersions.current = {}
+    sentFiles.current = new Set()
+    dirtyFilesRef.current.clear()
+    pendingRef.current = null
+    setActivePageBoth(roomId, pageId)
+    applyStoredSnapshot(roomId, pageId)
+    ensureLetterSurface(roomId, pageId)
+    for (const [, r] of rooms.current) {
+      try { r.ch.sender.set_current_doc?.(presenceDoc()) } catch {}
+    }
+    sendMsg({ t: 'snap-req' })
+    setStatus('connected — draw!')
+  }
+
+  // Letter pages get a fixed US-Letter frame as the writing surface
+  // (visual boundary + export unit). Created once per page as an ordinary
+  // element, so it syncs to peers like anything else.
+  const ensureLetterSurface = (roomId: string, pageId: string) => {
+    const a = apiRef.current
+    if (!a) return
+    const doc = docsRef.current.find((d) => d.id === roomId)
+    const page = doc?.pages.find((p) => p.id === pageId)
+    if (!page || !isLetterKind(page.kind)) return
+    let raw: string | null = null
+    try { raw = localStorage.getItem(snapKey(roomId, pageId)) } catch {}
+    if (raw && raw !== '[]') return // page already has content
+    if (a.getSceneElements().length > 0) return
+    const frame = {
+      id: `frame-${pageId}`,
+      type: 'frame',
+      x: 0, y: 0, width: LETTER_W, height: LETTER_H,
+      angle: 0, strokeColor: '#1e1e1e', backgroundColor: 'transparent',
+      fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+      roughness: 0, opacity: 100, strokeSharpness: 'sharp',
+      roundness: null, boundElements: [], link: null, locked: false,
+      name: page.name, index: null, version: 1, versionNonce: Math.floor(Math.random() * 2 ** 31),
+      isDeleted: false, groupIds: [], frameId: null,
+    } as any
+    remote.current = true
+    try { a.updateScene({ elements: [...a.getSceneElements(), frame] }) } finally { remote.current = false }
+    try { a.scrollToContent([frame] as any, { animate: true } as any) } catch {}
+  }
+
+  const createPage = (kind: PageKind, name?: string) => {
+    const roomId = activeRef.current
+    if (!roomId) return
+    const docs = [...docsRef.current]
+    const doc = docs.find((d) => d.id === roomId)
+    if (!doc) return
+    const count = doc.pages.length + 1
+    const date = todayName()
+    const pg: PageMeta = {
+      id: newPageId(),
+      name: name ?? (kind === 'daily' ? (doc.pages.some((p) => p.name === date) ? `${date} · ${count}` : date) : kind === 'letter' ? `Letter ${count}` : `Board ${count}`),
+      kind,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    doc.pages.push(pg)
+    setDocsBoth(docs)
+    broadcastPages()
+    switchPage(pg.id)
+  }
+
+  // Visiting the Daily tab lands on today's page, creating it if missing.
+  const switchFormat = (f: FormatTab) => {
+    const roomId = activeRef.current
+    if (!roomId) return
+    const doc = docsRef.current.find((d) => d.id === roomId)
+    if (!doc) return
+    activeFormatRef.current = f
+    setActiveFormat(f)
+    const inFormat = doc.pages.filter((p) => formatOf(p) === f)
+    if (inFormat.length) {
+      switchPage(inFormat[inFormat.length - 1].id)
+      return
+    }
+    if (f === 'daily') {
+      createPage('daily')
+    } else {
+      createPage(f === 'letters' ? 'letter' : 'board')
+    }
   }
 
   const ensureRoom = async (ticketStr: string, nickname: string, meta?: DocMeta): Promise<string> => {
@@ -357,7 +669,7 @@ export default function App() {
       rooms.current.set(roomId, { ch, owner, live: new Map() })
       pumpRoom(roomId, ch)
     }
-    // upsert doc meta
+    // upsert doc meta (never clobber the local page list with an older one)
     const docs = [...docsRef.current]
     const i = docs.findIndex((d) => d.id === roomId)
     const entry: DocMeta = {
@@ -366,30 +678,34 @@ export default function App() {
       name: meta?.name ?? docs[i]?.name ?? `doc-${roomId.slice(0, 6)}`,
       ticket: ticketStr,
       updatedAt: Date.now(),
+      pages: meta?.pages?.length ? meta.pages : (docs[i]?.pages?.length ? docs[i].pages : [mainPage()]),
     }
     if (i >= 0) docs[i] = entry
     else docs.push(entry)
     setDocsBoth(docs)
-    try { ch.sender.set_current_doc?.(roomId) } catch {}
+    try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     return roomId
   }
 
+  // A doc is an overarching topic. It starts with one board page;
+  // letter and daily pages are added from the format tabs inside.
   const createDoc = async () => {
     const node = nodeRef.current
     if (!node) return
     if (activeRef.current) persistSnapshot(activeRef.current)
+    const name = prompt('Topic name', `Topic ${docsRef.current.length + 1}`)
+    if (name === null) return
     const ch = await node.create(nick.current)
     const roomId: string = ch.id()
     const owner: string = me.current
     rooms.current.set(roomId, { ch, owner, live: new Map() })
     pumpRoom(roomId, ch)
     const ticket = ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
-    const name = `doc-${docsRef.current.length + 1}`
-    setDocsBoth([...docsRef.current, { id: roomId, owner, name, ticket, updatedAt: Date.now() }])
-    try { ch.sender.set_current_doc?.(roomId) } catch {}
+    setDocsBoth([...docsRef.current, { id: roomId, owner, name: name.trim() || `Topic ${docsRef.current.length + 1}`, ticket, updatedAt: Date.now(), pages: [mainPage()] }])
+    try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     switchDoc(roomId)
     await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
-    setStatus('new doc created — share link copied')
+    setStatus('new topic created — share link copied')
   }
 
   const pushCollaborators = () => {
@@ -500,16 +816,66 @@ export default function App() {
   // flush ~16/s instead of broadcasting every event (60ms keeps remote
   // strokes looking smooth; inbound rAF coalescing handles the rest).
   const dirtyRef = useRef(new Map<string, any>())
+  const dirtyFilesRef = useRef(new Map<string, any>())
+  const sentFiles = useRef<Set<string>>(new Set())
+  // Gossip cap is 256KB and oversize sends fail silently — stay well under.
+  const MAX_MSG = 180 * 1024
+
+  // Files for image elements, from the local files map. Only ones we
+  // haven't already broadcast (unless force, e.g. answering a snap-req
+  // from a newcomer who missed them).
+  const collectFilesFor = (elements: any[], force = false): any[] => {
+    const a = apiRef.current
+    if (!a) return []
+    let all: Record<string, any> = {}
+    try { all = a.getFiles() ?? {} } catch { return [] }
+    const out: any[] = []
+    for (const el of elements) {
+      const fid = el?.fileId
+      if (!fid || (!force && sentFiles.current.has(fid))) continue
+      const f = all[fid]
+      if (f) { out.push(f); sentFiles.current.add(fid) }
+    }
+    return out
+  }
+  const ingestFiles = (files: any[]) => {
+    const a = apiRef.current
+    if (!a || !Array.isArray(files) || !files.length) return
+    try {
+      a.addFiles(files)
+      for (const f of files) if (f?.id) sentFiles.current.add(f.id)
+    } catch {}
+  }
   const flushDirty = () => {
-    if (!dirtyRef.current.size) return
+    if (!dirtyRef.current.size && !dirtyFilesRef.current.size) return
     if (!me.current || !activeCh()) return
     if (!ownerIsLive()) return // owner offline → edits stop
     const els = [...dirtyRef.current.values()]
     dirtyRef.current.clear()
-    sendMsg({ t: 'p', elements: els })
+    const files = [...dirtyFilesRef.current.values()]
+    dirtyFilesRef.current.clear()
+    if (!files.length) {
+      if (els.length) sendMsg({ t: 'p', elements: els })
+      return
+    }
+    // Attach files inline when small; otherwise send elements first and
+    // follow with one 'f' message per file so nothing exceeds the cap.
+    const inline = JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG
+    if (inline) {
+      sendMsg({ t: 'p', elements: els, files })
+    } else {
+      if (els.length) sendMsg({ t: 'p', elements: els })
+      for (const f of files) {
+        if (JSON.stringify(f).length > MAX_MSG) {
+          setStatus('image too large to sync (>180KB)')
+          continue
+        }
+        sendMsg({ t: 'f', files: [f] })
+      }
+    }
   }
 
-  const onChange = (elements: readonly OrderedExcalidrawElement[]) => {
+  const onChange = (elements: readonly OrderedExcalidrawElement[], _appState: any, files: Record<string, any>) => {
     if (remote.current || !me.current || !activeCh()) return
     if (!ownerLive) return // owner offline → edits stop (flush rechecks live)
     let touched = false
@@ -519,6 +885,12 @@ export default function App() {
       const prev = dirtyRef.current.get(el.id)
       if (!prev || el.version >= prev.version) dirtyRef.current.set(el.id, el)
       touched = true
+      // Image element changed version (pasted, moved, resized): make sure
+      // its binary rides along at flush time.
+      const fid = (el as any)?.fileId
+      if (fid && !sentFiles.current.has(fid) && files?.[fid]) {
+        dirtyFilesRef.current.set(fid, files[fid])
+      }
     }
     if (touched && dirtyRef.current.size > 200) flushDirty() // backpressure: huge burst flushes early
   }
@@ -573,7 +945,7 @@ export default function App() {
   return (
     <div style={{ position: 'fixed', inset: 0 }}>
       <Excalidraw
-        excalidrawAPI={(a) => { setApi(a); apiRef.current = a; if (activeRef.current) applyStoredSnapshot(activeRef.current) }}
+        excalidrawAPI={(a) => { setApi(a); apiRef.current = a; if (activeRef.current) { applyStoredSnapshot(activeRef.current, activePageRef.current ?? 'main'); ensureLetterSurface(activeRef.current, activePageRef.current ?? 'main') } }}
         onChange={onChange}
         onPointerUpdate={onPointerUpdate}
         isCollaborating
@@ -586,7 +958,7 @@ export default function App() {
           </div>
         )}
         <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-          <button style={btn} onClick={createDoc}>+ new doc</button>
+          <button style={btn} onClick={createDoc}>+ topic</button>
           <button style={btn} onClick={() => setShowAdd((s) => !s)}>⤵ join</button>
         </div>
         {docs.length > 0 && (
@@ -606,12 +978,47 @@ export default function App() {
         {names.length > 0 && (
           <div style={{ opacity: 0.75, marginBottom: 4 }}>live here: {names.join(', ')}</div>
         )}
+        {activeDoc && (
+          <div style={{ marginBottom: 6 }}>
+            <div style={{ display: 'flex', gap: 4, marginBottom: 4 }}>
+              {(['board', 'letters', 'daily'] as FormatTab[]).map((f) => (
+                <button
+                  key={f}
+                  style={{ ...btn, background: activeFormat === f ? '#1a1d26' : '#eef0f6', color: activeFormat === f ? '#fff' : '#1a1d26' }}
+                  onClick={() => switchFormat(f)}
+                >
+                  {f === 'board' ? '◻ board' : f === 'letters' ? '▤ letters' : '📅 daily'}
+                </button>
+              ))}
+              <button
+                style={btn}
+                title={activeFormat === 'daily' ? 'new dated page' : activeFormat === 'letters' ? 'new letter' : 'new board page'}
+                onClick={() => createPage(activeFormat === 'letters' ? 'letter' : activeFormat === 'daily' ? 'daily' : 'board')}
+              >+</button>
+            </div>
+            {activeDoc.pages.filter((p) => formatOf(p) === activeFormat).length > 1 && (
+              <select
+                value={activePage ?? ''}
+                onChange={(e) => switchPage(e.target.value)}
+                style={{ ...input, margin: 0 }}
+              >
+                {activeDoc.pages.filter((p) => formatOf(p) === activeFormat).map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            )}
+          </div>
+        )}
         {knownPeers.length > 0 && (
           <div style={{ opacity: 0.75, marginBottom: 4, fontSize: 12 }}>
             <div style={{ fontWeight: 600 }}>peers seen</div>
-            {knownPeers.map(([pid, p]) => (
-              <div key={pid}>{p.nick} · {timeAgo(p.lastSeen)}{p.doc ? ` · ${p.doc.slice(0, 6)}` : ''}</div>
-            ))}
+            {knownPeers.map(([pid, p]) => {
+              const pd = parsePresenceDoc(p.doc)
+              const pgName = pd.page ? (activeDocPages().find((x) => x.id === pd.page)?.name ?? pd.page.slice(0, 6)) : null
+              return (
+                <div key={pid}>{p.nick} · {timeAgo(p.lastSeen)}{pd.doc ? ` · ${pd.doc.slice(0, 6)}` : ''}{pgName ? `/${pgName}` : ''}</div>
+              )
+            })}
           </div>
         )}
         {showAdd && (
@@ -647,7 +1054,7 @@ export default function App() {
             alert('Copied SVG')
           }}>SVG</button>
         </div>
-        <div style={{ opacity: 0.6, marginTop: 4, fontSize: 12 }}>{status}{activeDoc ? ` · ${activeDoc.name}` : ''}</div>
+        <div style={{ opacity: 0.6, marginTop: 4, fontSize: 12 }}>{status}{activeDoc ? ` · ${activeDoc.name}` : ''}{activePage ? ` / ${activeDoc?.pages.find((p) => p.id === activePage)?.name ?? ''}` : ''}</div>
         {DEBUG && <div style={{ opacity: 0.6, marginTop: 2, fontSize: 12 }}>💾 {saveInfo}</div>}
         {DEBUG && <button style={btn} onClick={() => setShowDbg((s) => !s)}>debug</button>}
         {DEBUG && <button style={btn} onClick={() => {
