@@ -136,6 +136,7 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [activePage, setActivePage] = useState<string | null>(null)
   const [activeFormat, setActiveFormat] = useState<FormatTab>('board')
+  const [showPanel, setShowPanel] = useState(false)
   const [ownerLive, setOwnerLive] = useState(true)
   const [saveInfo, setSaveInfo] = useState('not saved yet')
 
@@ -918,10 +919,25 @@ export default function App() {
   }
 
   const panel: React.CSSProperties = {
-    position: 'absolute', top: 12, left: 12, zIndex: 999, maxWidth: 300,
-    background: 'rgba(255,255,255,.92)', color: '#1a1d26', padding: 12, borderRadius: 14,
+    position: 'absolute', right: 12, bottom: 64, zIndex: 999, width: 300, maxHeight: '70vh', overflowY: 'auto',
+    background: 'rgba(255,255,255,.94)', color: '#1a1d26', padding: 12, borderRadius: 14,
     boxShadow: '0 8px 32px #0003', backdropFilter: 'blur(8px)',
     border: '1px solid #00000014', fontSize: 13, fontFamily: 'system-ui',
+  }
+  // Connection state for the status pill: red = offline, yellow = working,
+  // green = in a room.
+  const conn: 'off' | 'busy' | 'on' =
+    !id || /failed/i.test(status) ? 'off'
+    : !activeId || /starting|joining|ready/i.test(status) ? 'busy'
+    : 'on'
+  const connColor = conn === 'on' ? '#30a46c' : conn === 'busy' ? '#f5a524' : '#e5484d'
+  const pill: React.CSSProperties = {
+    position: 'absolute', right: 12, bottom: 12, zIndex: 1000,
+    display: 'flex', alignItems: 'center', gap: 8,
+    background: 'rgba(255,255,255,.94)', color: '#1a1d26', padding: '8px 14px', borderRadius: 999,
+    boxShadow: '0 8px 32px #0003', backdropFilter: 'blur(8px)',
+    border: '1px solid #00000014', fontSize: 13, fontFamily: 'system-ui', fontWeight: 700,
+    cursor: 'pointer',
   }
   const btn: React.CSSProperties = {
     background: '#eef0f6', color: '#1a1d26', border: '1px solid #00000014',
@@ -933,6 +949,11 @@ export default function App() {
   }
   const names = Object.values(online)
   const activeDoc = docs.find((d) => d.id === activeId)
+  // Hard edit lock: anyone may write while the owner is live, but when the
+  // owner is offline the canvas goes view-only. Without this, guests draw
+  // into a local fork that never syncs and gets clobbered on rejoin.
+  // (A real CRDT would remove the need for the lock — future work.)
+  const canEdit = !activeDoc || activeDoc.owner === id || !id || ownerLive
   const knownPeers = Object.entries(peers).sort((a, b) => b[1].lastSeen - a[1].lastSeen).slice(0, 12)
   const timeAgo = (ts: number) => {
     const s = Math.floor((Date.now() - ts) / 1000)
@@ -949,7 +970,16 @@ export default function App() {
         onChange={onChange}
         onPointerUpdate={onPointerUpdate}
         isCollaborating
+        viewModeEnabled={!canEdit}
       />
+      <button style={pill} onClick={() => setShowPanel((s) => !s)} title={status}>
+        <span style={{ width: 10, height: 10, borderRadius: 999, background: connColor, display: 'inline-block' }} />
+        ✦ live draw
+        <span style={{ fontWeight: 400, opacity: 0.65, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {activeDoc ? `${activeDoc.name}${!ownerLive ? ' · owner offline' : ''}` : status}
+        </span>
+      </button>
+      {showPanel && (
       <div style={panel}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ live draw</div>
         {!ownerLive && (
@@ -1069,6 +1099,7 @@ export default function App() {
           <pre style={{ fontSize: 10, fontFamily: 'monospace', background: '#0d0f16', color: '#9fe', borderRadius: 8, padding: 8, marginTop: 4, whiteSpace: 'pre-wrap' }}>{dbg}</pre>
         )}
       </div>
+      )}
     </div>
   )
 }
