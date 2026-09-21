@@ -1,17 +1,16 @@
 # p2p whiteboard with iroh
 
-*Experimental - there is no authentication. If someone knows your ticket, they can join as a peer.*
+*Experimental - there is no authentication. If someone knows your ticket, they can join as a peer. Does not work on Safari.*
 
 Inspired by wanting to integrate my tablet more deeply into my workflows.
 
-A vite webserver with a excalidraw canvas paired with iroh running over wasm. 
+A vite webserver with a excalidraw canvas paired with iroh running over wasm. Iroh dials your peer(s) and establishes a bidirectional QUIC connection. 
 
-<video src="./tinydemo.mov" width="600" controls></video>
+![demo](./minidemo.gif)
 
 Docs are topics. A topic owns board (the classic endless excalidraw whiteboard), letters (paginated board that has a set size), and dailies (which are a single page). For now, one peer owns the doc and holds the source of truth; everyone else goes view-only when the owner drops.
 
-## Build (MacBook, from clone)
-
+## Build 
 1. Have the wasm32-unknown-unknown target installed: `rustup target add wasm32-unknown-unknown`. I'm running an intel macbook, so Apple clang can't build ring for wasm - (in my case) use zig instead:
 ```sh
 cargo install cargo-zigbuild wasm-bindgen-cli
@@ -43,5 +42,9 @@ Hit **⧉ share** to copy a link for the current doc. Open it on the other devic
 
 State lives in the browser (localStorage per doc page). Refresh restores it. Clear-cache wipes it.
 
-## Agent handoff
-**agent JSON** / **SVG** buttons in the panel. Paste either into any agent. Future work: enable a agent to join as a peer.
+## Future work
+
+- Automatic stroke to .typ file
+- CRDT support
+- Identity management for allowlisting certain peers, or future agent connections
+- Experiment with DiffusionGemma or Jev generating AI-assisted strokes
