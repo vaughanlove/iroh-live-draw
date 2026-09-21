@@ -6,6 +6,8 @@ Inspired by wanting to integrate my tablet more deeply into my workflows.
 
 A vite webserver with a excalidraw canvas paired with iroh running over wasm. 
 
+<video src="./tinydemo.mov" width="600" controls></video>
+
 Docs are topics. A topic owns board (the classic endless excalidraw whiteboard), letters (paginated board that has a set size), and dailies (which are a single page). For now, one peer owns the doc and holds the source of truth; everyone else goes view-only when the owner drops.
 
 ## Build (MacBook, from clone)
