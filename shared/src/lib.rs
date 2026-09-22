@@ -1,13 +1,13 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 pub use iroh::EndpointId;
-pub use iroh::{RelayUrl, SecretKey};
+pub use iroh::{Endpoint, RelayUrl, SecretKey, TransportAddr};
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::{EndpointAddr, PublicKey, Signature, TransportAddr, protocol::Router};
+use iroh::{EndpointAddr, PublicKey, Signature, protocol::Router};
 pub use iroh_gossip::proto::TopicId;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
@@ -72,24 +72,108 @@ impl Ticket for DrawTicket {
     }
 
     fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
-        // postcard is positional: tickets minted before `owner` existed
-        // can't decode as the new struct, so fall back to the legacy shape.
-        if let Ok(ticket) = postcard::from_bytes::<Self>(bytes) {
-            return Ok(ticket);
+        let ticket = postcard::from_bytes(bytes)?;
+        Ok(ticket)
+    }
+}
+
+/// Transport-level access control: topic -> peers allowed to affect it.
+///
+/// The airtight line is message ingress — [`DrawNode::join`] drops signed
+/// messages from unauthorized peers before they can touch canvas or roster.
+/// Sender ids come from verified Ed25519 signatures, so they can't be
+/// spoofed; possession of a share ticket is what earns the initial allow.
+///
+/// Model: every topic has an owner (always allowed) and is open or closed.
+/// Open topics (the default: ticket = bearer credential) allow anyone not
+/// explicitly denied. Closed topics allow only the owner and allowed peers.
+/// Deny always wins — that is how an owner revokes a peer.
+///
+/// Limitation, stated plainly: gossip is a broadcast mesh, so a determined
+/// peer on the topic can still *see* bytes in flight. What they cannot do
+/// is affect state on any honest node. Per-topic encryption is the
+/// follow-up if you need secrecy too.
+#[derive(Clone, Default, Debug)]
+pub struct Firewall {
+    inner: Arc<Mutex<FirewallInner>>,
+}
+
+#[derive(Default, Debug)]
+struct FirewallInner {
+    owners: HashMap<TopicId, EndpointId>,
+    allowed: HashMap<TopicId, HashSet<EndpointId>>,
+    denied: HashMap<TopicId, HashSet<EndpointId>>,
+    open: HashSet<TopicId>,
+}
+
+impl Firewall {
+    pub fn set_owner(&self, topic: TopicId, owner: EndpointId) {
+        self.inner.lock().expect("poisoned").owners.insert(topic, owner);
+    }
+
+    /// Ticket-bearers: peers that proved (out-of-band) they hold the ticket.
+    pub fn allow(&self, topic: TopicId, peer: EndpointId) {
+        let mut inner = self.inner.lock().expect("poisoned");
+        inner.denied.entry(topic).or_default().remove(&peer);
+        inner.allowed.entry(topic).or_default().insert(peer);
+    }
+
+    /// Revoke: deny wins over allow and over open topics.
+    pub fn revoke(&self, topic: TopicId, peer: EndpointId) {
+        let mut inner = self.inner.lock().expect("poisoned");
+        inner.allowed.entry(topic).or_default().remove(&peer);
+        inner.denied.entry(topic).or_default().insert(peer);
+    }
+
+    pub fn set_open(&self, topic: TopicId, open: bool) {
+        let mut inner = self.inner.lock().expect("poisoned");
+        if open {
+            inner.open.insert(topic);
+        } else {
+            inner.open.remove(&topic);
         }
-        #[derive(serde::Deserialize)]
-        struct LegacyTicket {
-            topic_id: TopicId,
-            bootstrap: BTreeSet<EndpointId>,
-            relays: BTreeMap<EndpointId, RelayUrl>,
+    }
+
+    pub fn is_allowed(&self, topic: &TopicId, peer: &EndpointId) -> bool {
+        let inner = self.inner.lock().expect("poisoned");
+        if inner.denied.get(topic).is_some_and(|d| d.contains(peer)) {
+            return false;
         }
-        let legacy = postcard::from_bytes::<LegacyTicket>(bytes)?;
-        Ok(Self {
-            topic_id: legacy.topic_id,
-            bootstrap: legacy.bootstrap,
-            relays: legacy.relays,
-            owner: None,
-        })
+        if inner.owners.get(topic).is_some_and(|o| o == peer) {
+            return true;
+        }
+        if inner.open.contains(topic) {
+            return true;
+        }
+        inner.allowed.get(topic).is_some_and(|a| a.contains(peer))
+    }
+
+    /// Export this topic's rules for propagation (owner broadcasts these;
+    /// receivers apply them wholesale).
+    pub fn snapshot(&self, topic: &TopicId) -> (bool, Vec<EndpointId>, Vec<EndpointId>) {
+        let inner = self.inner.lock().expect("poisoned");
+        let open = inner.open.contains(topic);
+        let allowed = inner.allowed.get(topic).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let denied = inner.denied.get(topic).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        (open, allowed, denied)
+    }
+
+    /// Replace this topic's rules wholesale (applied from owner broadcasts).
+    pub fn apply_snapshot(
+        &self,
+        topic: TopicId,
+        open: bool,
+        allowed: Vec<EndpointId>,
+        denied: Vec<EndpointId>,
+    ) {
+        let mut inner = self.inner.lock().expect("poisoned");
+        if open {
+            inner.open.insert(topic);
+        } else {
+            inner.open.remove(&topic);
+        }
+        inner.allowed.insert(topic, allowed.into_iter().collect());
+        inner.denied.insert(topic, denied.into_iter().collect());
     }
 }
 
@@ -99,6 +183,7 @@ pub struct DrawNode {
     router: Router,
     gossip: Gossip,
     lookup: MemoryLookup,
+    firewall: Firewall,
 }
 
 impl DrawNode {
@@ -136,7 +221,13 @@ impl DrawNode {
             router,
             secret_key,
             lookup,
+            firewall: Firewall::default(),
         })
+    }
+
+    /// Transport-level access control for this node's topics.
+    pub fn firewall(&self) -> Firewall {
+        self.firewall.clone()
     }
 
     /// Returns the endpoint id of this endpoint.
@@ -147,6 +238,12 @@ impl DrawNode {
     /// Secret key for stable identity (persist out-of-band, e.g. localStorage).
     pub fn secret_key(&self) -> SecretKey {
         self.secret_key.clone()
+    }
+
+    /// Cloned endpoint handle (for address introspection, e.g. learning a
+    /// neighbor's relay to keep tickets redialable).
+    pub fn endpoint(&self) -> Endpoint {
+        self.router.endpoint().clone()
     }
 
     /// Our current home relay, if the endpoint has settled on one. Tickets
@@ -184,6 +281,18 @@ impl DrawNode {
             self.lookup.add_endpoint_info(addr);
         }
         info!(?bootstrap, "joining {topic_id}");
+        // Seed the firewall: the owner is authoritative, bootstrap peers
+        // proved ticket possession out-of-band, and topics stay open so
+        // ticket-holders who dial in through the mesh are allowed.
+        // Revocation (deny) still wins over all of this.
+        if let Some(owner) = ticket.owner {
+            self.firewall.set_owner(topic_id, owner);
+        }
+        self.firewall.allow(topic_id, self.endpoint_id());
+        for id in ticket.bootstrap.iter() {
+            self.firewall.allow(topic_id, *id);
+        }
+        self.firewall.set_open(topic_id, true);
         let gossip_topic = self.gossip.subscribe(topic_id, bootstrap).await?;
         let (sender, receiver) = gossip_topic.split();
 
@@ -230,10 +339,14 @@ impl DrawNode {
         // We'll want to map the events to our own event type, which includes parsing
         // the messages and verifying the signatures, and trigger presence
         // once the swarm is joined initially.
+        // Unauthorized peers are dropped here, at ingress: their bytes never
+        // become Events, so they can't touch canvas or roster downstream.
+        let firewall = self.firewall.clone();
         let receiver = n0_future::stream::try_unfold(receiver, {
             let trigger_presence = trigger_presence.clone();
             move |mut receiver| {
                 let trigger_presence = trigger_presence.clone();
+                let firewall = firewall.clone();
                 async move {
                     loop {
                         // Store if we were joined before the next event comes in.
@@ -243,6 +356,18 @@ impl DrawNode {
                         let Some(event) = receiver.try_next().await? else {
                             return Ok(None);
                         };
+                        if let GossipEvent::Received(ref msg) = event {
+                            match SignedMessage::verify_and_decode(&msg.content) {
+                                Ok(rx) if firewall.is_allowed(&topic_id, &rx.from) => {}
+                                Ok(rx) => {
+                                    warn!(from = %rx.from, %topic_id, "firewall: dropped message from unauthorized peer");
+                                    continue;
+                                }
+                                // Undecodable: fall through to try_into below,
+                                // which logs it as an invalid message.
+                                Err(_) => {}
+                            }
+                        }
                         // Convert into our event type. this fails if we receive a message
                         // that cannot be decoced into our event type. If that is the case,
                         // we just keep and log the error.

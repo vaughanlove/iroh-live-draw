@@ -12,13 +12,41 @@ export class Channel {
     private constructor();
     free(): void;
     [Symbol.dispose](): void;
+    /**
+     * Allow a peer on this topic (no-op on open topics unless revoked).
+     */
+    allow_peer(peer: string): void;
+    /**
+     * Apply an owner-broadcast rule snapshot (JSON from `firewall_snapshot`).
+     */
+    apply_firewall(json: string): void;
+    /**
+     * Export this topic's firewall rules as JSON
+     * (`{open, allowed[], revoked[]}`) for owner broadcast.
+     */
+    firewall_snapshot(): string;
+    /**
+     * Query the local firewall replica: does this peer currently have
+     * access to this topic? PeerList `has_access` is derived from this.
+     */
+    has_access(peer: string): boolean;
     id(): string;
     neighbors(): string[];
     /**
      * Owner endpoint id (source of truth), if known.
      */
     owner(): string | undefined;
-    ticket(opts: any): string;
+    /**
+     * Revoke a peer: their messages are dropped at ingress from now on.
+     * Deny wins over allow and over open topics.
+     */
+    revoke_peer(peer: string): void;
+    /**
+     * Open topics allow any ticket-holder; closed topics allow only the
+     * owner and explicitly allowed peers. New topics join open.
+     */
+    set_open(open: boolean): void;
+    ticket(opts: any): Promise<string>;
     readonly receiver: ReadableStream;
     readonly sender: ChannelSender;
 }

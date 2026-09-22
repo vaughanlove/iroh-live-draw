@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use draw_shared::{ChatSender, DrawTicket, EndpointId, RelayUrl, TopicId};
+use draw_shared::{ChatSender, DrawTicket, Endpoint, EndpointId, RelayUrl, TopicId};
 use draw_shared::DrawNode as SharedNode;
 use n0_future::{StreamExt, time::Duration};
 use serde::{Deserialize, Serialize};
@@ -144,8 +144,10 @@ impl DrawNode {
             relays,
             neighbors,
             me: self.0.endpoint_id(),
+            endpoint: self.0.endpoint(),
             sender,
             receiver,
+            firewall: self.0.firewall(),
         };
         Ok(topic)
     }
@@ -158,11 +160,13 @@ pub struct Channel {
     topic_id: TopicId,
     owner: Option<EndpointId>,
     me: EndpointId,
+    endpoint: Endpoint,
     bootstrap: BTreeSet<EndpointId>,
     relays: BTreeMap<EndpointId, RelayUrl>,
     neighbors: Arc<Mutex<BTreeSet<EndpointId>>>,
     sender: ChannelSender,
     receiver: ChannelReceiver,
+    firewall: draw_shared::Firewall,
 }
 
 #[wasm_bindgen]
@@ -177,7 +181,7 @@ impl Channel {
         self.receiver.clone()
     }
 
-    pub fn ticket(&self, opts: JsValue) -> Result<String, JsError> {
+    pub async fn ticket(&mut self, opts: JsValue) -> Result<String, JsError> {
         let opts: TicketOpts = serde_wasm_bindgen::from_value(opts)?;
         let mut ticket = DrawTicket::new(self.topic_id);
         ticket.owner = self.owner;
@@ -198,6 +202,16 @@ impl Channel {
             ticket.bootstrap.insert(id);
             if let Some(url) = self.relays.get(&id) {
                 ticket.relays.insert(id, url.clone());
+            } else if let Some(info) = self.endpoint.remote_info(id).await {
+                // Learn neighbors' relays from live connections so re-shared
+                // tickets stay redialable after churn (no discovery in browsers).
+                for addr in info.into_addrs() {
+                    if let draw_shared::TransportAddr::Relay(url) = addr.into_addr() {
+                        ticket.relays.insert(id, url.clone());
+                        self.relays.insert(id, url);
+                        break;
+                    }
+                }
             }
         }
         tracing::info!("opts {:?} ticket {:?}", opts, ticket);
@@ -211,6 +225,72 @@ impl Channel {
     /// Owner endpoint id (source of truth), if known.
     pub fn owner(&self) -> Option<String> {
         self.owner.as_ref().map(|o| o.to_string())
+    }
+
+    fn peer_arg(&self, peer: &str) -> Result<EndpointId, JsError> {
+        peer.trim()
+            .parse()
+            .map_err(|e| JsError::new(&format!("bad endpoint id: {e}")))
+    }
+
+    /// Allow a peer on this topic (no-op on open topics unless revoked).
+    pub fn allow_peer(&self, peer: String) -> Result<(), JsError> {
+        self.firewall.allow(self.topic_id, self.peer_arg(&peer)?);
+        Ok(())
+    }
+
+    /// Revoke a peer: their messages are dropped at ingress from now on.
+    /// Deny wins over allow and over open topics.
+    pub fn revoke_peer(&self, peer: String) -> Result<(), JsError> {
+        self.firewall.revoke(self.topic_id, self.peer_arg(&peer)?);
+        Ok(())
+    }
+
+    /// Open topics allow any ticket-holder; closed topics allow only the
+    /// owner and explicitly allowed peers. New topics join open.
+    pub fn set_open(&self, open: bool) {
+        self.firewall.set_open(self.topic_id, open);
+    }
+
+    /// Query the local firewall replica: does this peer currently have
+    /// access to this topic? PeerList `has_access` is derived from this.
+    pub fn has_access(&self, peer: String) -> Result<bool, JsError> {
+        Ok(self.firewall.is_allowed(&self.topic_id, &self.peer_arg(&peer)?))
+    }
+
+    /// Export this topic's firewall rules as JSON
+    /// (`{open, allowed[], revoked[]}`) for owner broadcast.
+    pub fn firewall_snapshot(&self) -> Result<String, JsError> {
+        let (open, allowed, denied) = self.firewall.snapshot(&self.topic_id);
+        let snap = serde_json::json!({
+            "open": open,
+            "allowed": allowed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "revoked": denied.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        });
+        serde_json::to_string(&snap).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Apply an owner-broadcast rule snapshot (JSON from `firewall_snapshot`).
+    pub fn apply_firewall(&self, json: String) -> Result<(), JsError> {
+        let snap: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| JsError::new(&format!("bad firewall snapshot: {e}")))?;
+        let parse_ids = |key: &str| -> Result<Vec<EndpointId>, JsError> {
+            snap.get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|id| {
+                            id.as_str()
+                                .ok_or_else(|| JsError::new("bad endpoint id in snapshot"))
+                                .and_then(|s| s.parse().map_err(|e| JsError::new(&format!("bad endpoint id: {e}"))))
+                        })
+                        .collect()
+                })
+                .unwrap_or(Ok(Vec::new()))
+        };
+        let open = snap.get("open").and_then(|v| v.as_bool()).unwrap_or(true);
+        self.firewall.apply_snapshot(self.topic_id, open, parse_ids("allowed")?, parse_ids("revoked")?);
+        Ok(())
     }
 
     pub fn neighbors(&self) -> Vec<String> {

@@ -15,3 +15,7 @@ web/dist/
 
 # wrangler / tooling caches
 .wrangler/
+
+# e2e sandbox artifacts
+/e2e/logs/
+e2e/node_modules/
