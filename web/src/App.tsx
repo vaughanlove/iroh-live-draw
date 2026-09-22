@@ -32,6 +32,7 @@ const LS_SECRET = 'draw.secret'
 const LS_DOCS = 'draw.docs'
 const LS_PEERS = 'draw.peers'
 const LS_PAGE = 'draw.activepage'
+const LS_ALIASES = 'draw.aliases'
 const SS_TAB = 'draw.tab'
 
 // US Letter at 96dpi — the writing surface for letter pages.
@@ -125,7 +126,20 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [activePage, setActivePage] = useState<string | null>(null)
   const [activeFormat, setActiveFormat] = useState<FormatTab>('board')
-  const [showPanel, setShowPanel] = useState(false)
+  // Overlay views: null = canvas, 'tools' = slim canvas panel,
+  // 'topics' = topic cards, 'peers' = peer management.
+  const [view, setView] = useState<null | 'tools' | 'topics' | 'peers'>(null)
+  const [aliases, setAliases] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem(LS_ALIASES) ?? '{}') } catch { return {} }
+  })
+  const dispNick = (pid: string, fallback: string) => aliases[pid] ?? fallback
+  const setAlias = (pid: string, alias: string) => {
+    const next = { ...aliases }
+    if (alias.trim()) next[pid] = alias.trim()
+    else delete next[pid]
+    setAliases(next)
+    try { localStorage.setItem(LS_ALIASES, JSON.stringify(next)) } catch {}
+  }
   const [ownerLive, setOwnerLive] = useState(true)
   const [saveInfo, setSaveInfo] = useState('not saved yet')
 
@@ -980,7 +994,7 @@ export default function App() {
       map.set(from, {
         pointer: { x: c.x, y: c.y, tool: 'pointer' },
         button: 'up',
-        username: (onlineRef.current[from] ?? peersRef.current[from]?.nick ?? from.slice(0, 6)),
+        username: dispNick(from, onlineRef.current[from] ?? peersRef.current[from]?.nick ?? from.slice(0, 6)),
       })
     }
     a.updateScene({ collaborators: map as any })
@@ -997,8 +1011,6 @@ export default function App() {
           : await DN.spawn()
         if (dead) return
         nodeRef.current = node
-        // NOTE: do NOT persist node.secret_key() — it is the per-tab
-        // derived key; the base secret is managed by tabSecretHex().
         const myId = node.endpoint_id() as string
         me.current = myId
         nick.current = 'peer-' + myId.slice(0, 6)
@@ -1279,9 +1291,9 @@ export default function App() {
     width: '100%', margin: '6px 0', background: '#fff', color: '#1a1d26',
     border: '1px solid #00000022', borderRadius: 8, padding: '5px 8px', fontSize: 12,
   }
-  const names = Object.values(online)
+  const names = Object.entries(online)
   const activeDoc = docs.find((d) => d.id === activeId)
-  const knownPeers = Object.entries(peers).sort((a, b) => b[1].lastSeen - a[1].lastSeen).slice(0, 12)
+  const knownPeers = Object.entries(peers).sort((a, b) => b[1].lastSeen - a[1].lastSeen).slice(0, 30)
   const timeAgo = (ts: number) => {
     const s = Math.floor((Date.now() - ts) / 1000)
     if (s < 5) return 'now'
@@ -1290,6 +1302,124 @@ export default function App() {
     if (m < 60) return `${m}m ago`
     return `${Math.floor(m / 60)}h ago`
   }
+  const peersOnDoc = (docId: string) =>
+    Object.entries(peers).filter(([, p]) => parsePresenceDoc(p.doc).doc === docId)
+  const myDocs = docs.filter((d) => d.owner === id)
+  const sharedDocs = docs.filter((d) => d.owner !== id)
+
+  const overlayBack: React.CSSProperties = {
+    position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(18,20,28,.5)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+    fontFamily: 'system-ui',
+  }
+  const sheet: React.CSSProperties = {
+    background: '#fff', color: '#1a1d26', borderRadius: 20, padding: 20,
+    width: 'min(760px, 94vw)', maxHeight: '86vh', overflowY: 'auto',
+    boxShadow: '0 24px 80px #0008',
+  }
+  const cardGrid: React.CSSProperties = {
+    display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 12,
+  }
+  const card: React.CSSProperties = {
+    border: '1px solid #00000014', borderRadius: 16, padding: 14, cursor: 'pointer',
+    background: '#f7f8fc',
+  }
+  const cardActive: React.CSSProperties = { ...card, border: '2px solid #1a1d26', background: '#fff' }
+  const tabBtn = (active: boolean): React.CSSProperties => ({
+    ...btn, background: active ? '#1a1d26' : '#eef0f6', color: active ? '#fff' : '#1a1d26',
+    fontWeight: 700,
+  })
+
+  const openDoc = (roomId: string) => {
+    switchDoc(roomId)
+    setView(null)
+  }
+  const joinTicket = async () => {
+    setShowAdd(false)
+    setStatus('joining…')
+    try {
+      const roomId = await ensureRoom(peer.trim(), nick.current)
+      switchDoc(roomId)
+      sendMsg({ t: 'snap-req' })
+      setPeer('')
+      setView(null)
+    } catch (e) { setStatus(`join failed: ${e}`) }
+  }
+
+  const renderTopicCards = (list: DocMeta[]) => (
+    <div style={cardGrid}>
+      {list.map((d) => {
+        const access = peersOnDoc(d.id)
+        const live = rooms.current.get(d.id)?.live.size ?? 0
+        const counts = (['board', 'letters', 'daily'] as FormatTab[]).map(
+          (f) => d.pages.filter((p) => formatOf(p) === f).length,
+        )
+        return (
+          <div key={d.id} style={d.id === activeId ? cardActive : card} onClick={() => openDoc(d.id)}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>{d.name}{d.owner === id ? ' ★' : ''}</div>
+            <div style={{ fontSize: 12, opacity: 0.65, marginBottom: 6 }}>
+              {counts[0]} board · {counts[1]} letters · {counts[2]} daily
+              {live > 0 && ` · ${live} live`}
+            </div>
+            <div style={{ fontSize: 12, opacity: 0.75 }}>
+              {d.owner === id ? 'owned by you' : `owner ${d.owner?.slice(0, 6) ?? '?'}`}
+              {access.length > 0 && (
+                <span> · {access.slice(0, 4).map(([pid, p]) => dispNick(pid, p.nick)).join(', ')}{access.length > 4 ? ` +${access.length - 4}` : ''}</span>
+              )}
+            </div>
+          </div>
+        )
+      })}
+      <div style={{ ...card, borderStyle: 'dashed', display: 'flex', flexDirection: 'column', gap: 8, cursor: 'default' }}>
+        <button style={btn} onClick={createDoc}>+ new topic</button>
+        {!showAdd
+          ? <button style={btn} onClick={() => setShowAdd(true)}>⤵ join with ticket</button>
+          : (
+            <div>
+              <input placeholder="paste ticket…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
+              <button style={btn} onClick={joinTicket}>join</button>
+            </div>
+          )}
+      </div>
+    </div>
+  )
+
+  const renderPeers = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {knownPeers.length === 0 && <div style={{ opacity: 0.6 }}>No peers seen yet — share a ticket to connect.</div>}
+      {knownPeers.map(([pid, p]) => {
+        const pd = parsePresenceDoc(p.doc)
+        const pgName = pd.page ? (activeDocPages().find((x) => x.id === pd.page)?.name ?? pd.page.slice(0, 6)) : null
+        const onActiveDoc = pd.doc === activeId
+        const iOwn = !!activeDoc && activeDoc.owner === id
+        return (
+          <div key={pid} style={{ ...card, cursor: 'default', display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input
+              key={pid + ':' + (aliases[pid] ?? '')}
+              defaultValue={aliases[pid] ?? ''}
+              placeholder={p.nick}
+              title="nickname (stored locally, only you see it)"
+              style={{ ...input, margin: 0, width: 130 }}
+              onBlur={(e) => setAlias(pid, e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+            />
+            <div style={{ fontSize: 12, opacity: 0.75, flex: 1 }}>
+              {p.nick} · {timeAgo(p.lastSeen)}
+              {pd.doc ? ` · ${pd.doc.slice(0, 6)}` : ''}{pgName ? `/${pgName}` : ''}
+              {p.hasAccess === false && <span style={{ color: '#e5484d' }}> · revoked</span>}
+            </div>
+            {iOwn && onActiveDoc && (
+              <button
+                style={{ ...btn, padding: '1px 8px', fontSize: 11 }}
+                title={p.hasAccess === false ? 'allow back onto this doc' : 'revoke access to this doc'}
+                onClick={() => activeId && setFwRule(activeId, pid, p.hasAccess === false)}
+              >{p.hasAccess === false ? 'allow' : 'revoke'}</button>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
   return (
     <div style={{ position: 'fixed', inset: 0 }}>
       <Excalidraw
@@ -1297,38 +1427,23 @@ export default function App() {
         onChange={onChange}
         onPointerUpdate={onPointerUpdate}
         isCollaborating
+        renderTopRightUI={() => null}
       />
-      <button style={pill} onClick={() => setShowPanel((s) => !s)} title={status}>
+      <button style={pill} onClick={() => setView('topics')} title={status}>
         <span style={{ width: 10, height: 10, borderRadius: 999, background: connColor, display: 'inline-block' }} />
         ✦ live draw
         <span style={{ fontWeight: 400, opacity: 0.65, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {activeDoc ? `${activeDoc.name}` : status}
         </span>
       </button>
-      {showPanel && (
-      <div style={panel}>
-        <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ live draw</div>
-        <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-          <button style={btn} onClick={createDoc}>+ topic</button>
-          <button style={btn} onClick={() => setShowAdd((s) => !s)}>⤵ join</button>
-        </div>
-        {docs.length > 0 && (
-          <div style={{ marginBottom: 6 }}>
-            {docs.map((d) => (
-              <button
-                key={d.id}
-                style={{ ...btn, background: d.id === activeId ? '#1a1d26' : '#eef0f6', color: d.id === activeId ? '#fff' : '#1a1d26' }}
-                onClick={() => switchDoc(d.id)}
-                title={`owner: ${d.owner?.slice(0, 8) ?? '?'}`}
-              >
-                {d.name}{d.owner === id ? ' ★' : ''}
-              </button>
-            ))}
-          </div>
-        )}
-        {names.length > 0 && (
-          <div style={{ opacity: 0.75, marginBottom: 4 }}>live here: {names.join(', ')}</div>
-        )}
+      <button
+        style={{ ...pill, right: undefined, left: 12, padding: '8px 12px' }}
+        onClick={() => setView((v) => (v === 'tools' ? null : 'tools'))}
+        title="canvas tools"
+      >⋯</button>
+      {view === 'tools' && (
+      <div style={{ ...panel, left: 12, right: undefined }}>
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ tools</div>
         {activeDoc && (
           <div style={{ marginBottom: 6 }}>
             <div style={{ display: 'flex', gap: 4, marginBottom: 4 }}>
@@ -1360,43 +1475,9 @@ export default function App() {
             )}
           </div>
         )}
-        {knownPeers.length > 0 && (
-          <div style={{ opacity: 0.75, marginBottom: 4, fontSize: 12 }}>
-            <div style={{ fontWeight: 600 }}>peers seen</div>
-            {knownPeers.map(([pid, p]) => {
-              const pd = parsePresenceDoc(p.doc)
-              const pgName = pd.page ? (activeDocPages().find((x) => x.id === pd.page)?.name ?? pd.page.slice(0, 6)) : null
-              const onActiveDoc = pd.doc === activeId
-              const iOwn = !!activeDoc && activeDoc.owner === id
-              return (
-                <div key={pid}>
-                  {p.nick} · {timeAgo(p.lastSeen)}{pd.doc ? ` · ${pd.doc.slice(0, 6)}` : ''}{pgName ? `/${pgName}` : ''}
-                  {p.hasAccess === false && <span style={{ color: '#e5484d' }}> · revoked</span>}
-                  {iOwn && onActiveDoc && (
-                    <button
-                      style={{ ...btn, padding: '1px 8px', fontSize: 11, margin: '0 0 0 6px' }}
-                      title={p.hasAccess === false ? 'allow back onto this doc' : 'revoke access to this doc'}
-                      onClick={() => activeId && setFwRule(activeId, pid, p.hasAccess === false)}
-                    >{p.hasAccess === false ? 'allow' : 'revoke'}</button>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-        )}
-        {showAdd && (
-          <div>
-            <input placeholder="paste ticket…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
-            <button style={btn} onClick={async () => {
-              setShowAdd(false)
-              setStatus('joining…')
-              try {
-                const roomId = await ensureRoom(peer.trim(), nick.current)
-                switchDoc(roomId)
-                sendMsg({ t: 'snap-req' })
-                setPeer('')
-              } catch (e) { setStatus(`join failed: ${e}`) }
-            }}>join</button>
+        {names.length > 0 && (
+          <div style={{ opacity: 0.75, marginBottom: 4 }}>
+            live here: {names.map(([pid, n]) => dispNick(pid, n)).join(', ')}
           </div>
         )}
         <div style={{ marginTop: 6 }}>
@@ -1432,6 +1513,37 @@ export default function App() {
           <pre style={{ fontSize: 10, fontFamily: 'monospace', background: '#0d0f16', color: '#9fe', borderRadius: 8, padding: 8, marginTop: 4, whiteSpace: 'pre-wrap' }}>{dbg}</pre>
         )}
       </div>
+      )}
+      {(view === 'topics' || view === 'peers') && (
+        <div style={overlayBack} onClick={() => setView(null)}>
+          <div style={sheet} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
+              <button style={tabBtn(view === 'topics')} onClick={() => setView('topics')}>Topics</button>
+              <button style={tabBtn(view === 'peers')} onClick={() => setView('peers')}>Peers</button>
+              <span style={{ flex: 1 }} />
+              <button style={btn} onClick={() => setView(null)}>✕</button>
+            </div>
+            {view === 'topics' && (
+              <div>
+                {myDocs.length > 0 && (
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 8 }}>My topics</div>
+                    {renderTopicCards(myDocs)}
+                  </div>
+                )}
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>Shared with me</div>
+                  {sharedDocs.length > 0
+                    ? renderTopicCards(sharedDocs)
+                    : (myDocs.length === 0 ? renderTopicCards([]) : (
+                      <div style={{ opacity: 0.6, fontSize: 13 }}>Nothing shared yet.</div>
+                    ))}
+                </div>
+              </div>
+            )}
+            {view === 'peers' && renderPeers()}
+          </div>
+        </div>
       )}
     </div>
   )

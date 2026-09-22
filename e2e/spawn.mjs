@@ -57,18 +57,35 @@ async function pillText(page) {
     return pill ? pill.textContent.trim().slice(0, 160) : '(no pill)';
   });
 }
-async function openPanel(page) {
-  await page.evaluate(() => {
-    const pill = [...document.querySelectorAll('button')].find((b) => b.textContent?.includes('live draw') && b.textContent.length < 120);
-    if (pill && !document.body.textContent.includes('peers seen')) pill.click();
+async function pillButton(page) {
+  return page.evaluate(() => {
+    const btns = [...document.querySelectorAll('button')];
+    return btns.findIndex((b) => b.textContent?.includes('live draw') && b.textContent.length < 160);
   });
+}
+async function openPanel(page) {
+  // Pill opens the topics overlay; Peers tab holds the roster.
+  const idx = await pillButton(page);
+  if (idx >= 0) await page.evaluate((i) => [...document.querySelectorAll('button')][i].click(), idx);
   await sleep(500);
 }
+async function openPeers(page) {
+  await openPanel(page);
+  const done = await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Peers');
+    if (b) { b.click(); return true; }
+    return false;
+  });
+  await sleep(500);
+  return done;
+}
 async function panelText(page) {
-  // Scope to the live-draw panel (body text is mostly Excalidraw chrome).
+  // Scope to the overlay sheet when open (body text is Excalidraw chrome).
   return page.evaluate(() => {
     const els = [...document.querySelectorAll('div')];
-    const panel = els.find((d) => d.textContent?.includes('peers seen') || (d.textContent?.includes('✦ live draw') && d.textContent.includes('+ topic')));
+    const sheet = els.find((d) => d.textContent?.includes('Shared with me') || d.textContent?.includes('No peers seen yet') || d.textContent?.includes('My topics'));
+    if (sheet) return sheet.innerText.slice(0, 1500);
+    const panel = els.find((d) => d.textContent?.includes('✦ tools'));
     return (panel ? panel.innerText : document.body.innerText).slice(0, 1500);
   });
 }
@@ -100,7 +117,7 @@ async function scenarioLiveness() {
     await sleep(8000);
     log('owner', 'pill:', await pillText(A));
     await openPanel(A);
-    if (!(await clickBtn(A, '+ topic'))) throw new Error('no + topic button');
+    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
     await sleep(6000);
     const aLs = await ls(A);
     const docs = JSON.parse(aLs['draw.docs'] ?? '[]');
@@ -116,12 +133,12 @@ async function scenarioLiveness() {
     const B = await openTab(browser, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
     await sleep(10000);
     log('guest', 'pill:', await pillText(B));
-    await openPanel(B);
+    await openPeers(B);
     log('guest', 'panel:', (await panelText(B)).replace(/\n/g, ' | ').slice(0, 800));
 
     // Steady state: both should see each other.
     await sleep(8000);
-    await openPanel(A);
+    await openPeers(A);
     log('owner', 'panel:', (await panelText(A)).replace(/\n/g, ' | ').slice(0, 800));
 
     // Kill the owner. Watch the guest judge liveness.
@@ -131,7 +148,7 @@ async function scenarioLiveness() {
       await sleep(5000);
       log('guest', `t+${(i + 1) * 5}s pill:`, await pillText(B));
     }
-    await openPanel(B);
+    await openPeers(B);
     log('guest', 'panel after owner death:', (await panelText(B)).replace(/\n/g, ' | ').slice(0, 800));
 
     // Owner returns (fresh tab, same profile).
@@ -139,17 +156,17 @@ async function scenarioLiveness() {
     const A2 = await openTab(browser, 'owner2', `${APP_URL}/?debug=1`);
     await sleep(10000);
     log('owner2', 'pill:', await pillText(A2));
-    await openPanel(A2);
+    await openPeers(A2);
     log('owner2', 'panel:', (await panelText(A2)).replace(/\n/g, ' | ').slice(0, 800));
     await sleep(15000);
-    await openPanel(B);
+    await openPeers(B);
     log('guest', 'panel after owner return:', (await panelText(B)).replace(/\n/g, ' | ').slice(0, 800));
     // Same-id reconnect may leave the mesh half-built (stale gossip state
     // for the rebooted id). Reload the guest for a clean handshake.
     log('harness', 'reloading guest for clean handshake');
     await B.reload({ waitUntil: 'networkidle2' });
     await sleep(15000);
-    await openPanel(B);
+    await openPeers(B);
     log('guest', 'panel after guest reload:', (await panelText(B)).replace(/\n/g, ' | ').slice(0, 800));
     await A2.close();
     await B.close();
@@ -174,7 +191,7 @@ async function scenarioCrdt() {
     const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
     await sleep(8000);
     await openPanel(A);
-    if (!(await clickBtn(A, '+ topic'))) throw new Error('no + topic button');
+    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
     await sleep(6000);
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     if (!docs.length || !docs[0].ticket) throw new Error('no ticket');
