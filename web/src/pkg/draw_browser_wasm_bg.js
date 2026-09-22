@@ -16,6 +16,68 @@ export class Channel {
         wasm.__wbg_channel_free(ptr, 0);
     }
     /**
+     * Allow a peer on this topic (no-op on open topics unless revoked).
+     * @param {string} peer
+     */
+    allow_peer(peer) {
+        const ptr0 = passStringToWasm0(peer, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.channel_allow_peer(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Apply an owner-broadcast rule snapshot (JSON from `firewall_snapshot`).
+     * @param {string} json
+     */
+    apply_firewall(json) {
+        const ptr0 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.channel_apply_firewall(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Export this topic's firewall rules as JSON
+     * (`{open, allowed[], revoked[]}`) for owner broadcast.
+     * @returns {string}
+     */
+    firewall_snapshot() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.channel_firewall_snapshot(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Query the local firewall replica: does this peer currently have
+     * access to this topic? PeerList `has_access` is derived from this.
+     * @param {string} peer
+     * @returns {boolean}
+     */
+    has_access(peer) {
+        const ptr0 = passStringToWasm0(peer, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.channel_has_access(this.__wbg_ptr, ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
+    }
+    /**
      * @returns {string}
      */
     id() {
@@ -60,6 +122,19 @@ export class Channel {
         return ret;
     }
     /**
+     * Revoke a peer: their messages are dropped at ingress from now on.
+     * Deny wins over allow and over open topics.
+     * @param {string} peer
+     */
+    revoke_peer(peer) {
+        const ptr0 = passStringToWasm0(peer, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.channel_revoke_peer(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * @returns {ChannelSender}
      */
     get sender() {
@@ -67,26 +142,20 @@ export class Channel {
         return ChannelSender.__wrap(ret);
     }
     /**
+     * Open topics allow any ticket-holder; closed topics allow only the
+     * owner and explicitly allowed peers. New topics join open.
+     * @param {boolean} open
+     */
+    set_open(open) {
+        wasm.channel_set_open(this.__wbg_ptr, open);
+    }
+    /**
      * @param {any} opts
-     * @returns {string}
+     * @returns {Promise<string>}
      */
     ticket(opts) {
-        let deferred2_0;
-        let deferred2_1;
-        try {
-            const ret = wasm.channel_ticket(this.__wbg_ptr, opts);
-            var ptr1 = ret[0];
-            var len1 = ret[1];
-            if (ret[3]) {
-                ptr1 = 0; len1 = 0;
-                throw takeFromExternrefTable0(ret[2]);
-            }
-            deferred2_0 = ptr1;
-            deferred2_1 = len1;
-            return getStringFromWasm0(ptr1, len1);
-        } finally {
-            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
-        }
+        const ret = wasm.channel_ticket(this.__wbg_ptr, opts);
+        return ret;
     }
 }
 if (Symbol.dispose) Channel.prototype[Symbol.dispose] = Channel.prototype.free;
@@ -970,42 +1039,42 @@ export function __wbg_wasClean_a32ef5f1fd90161e(arg0) {
     return ret;
 }
 export function __wbindgen_generic_0000000000000001(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2991, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3019, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb524c411cc4612b6);
     return ret;
 }
 export function __wbindgen_generic_0000000000000002(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4950, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4978, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4c9b27a236c12df4);
     return ret;
 }
 export function __wbindgen_generic_0000000000000003(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1717, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1746, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1c3399259ee45d8a);
     return ret;
 }
 export function __wbindgen_generic_0000000000000004(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3654, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3682, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h79bd56fd0616473d);
     return ret;
 }
 export function __wbindgen_generic_0000000000000005(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 2956, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 2984, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23f7e27b78ef2f58);
     return ret;
 }
 export function __wbindgen_generic_0000000000000006(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3191, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3219, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1b297369af64787e);
     return ret;
 }
 export function __wbindgen_generic_0000000000000007(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3215, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3243, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
     const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__he0976379ed5281ba);
     return ret;
 }
 export function __wbindgen_generic_0000000000000008(arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 4921, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 4949, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h46f28b73f3eb178c);
     return ret;
 }

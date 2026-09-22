@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
 import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
-import nacl from 'tweetnacl'
 import { DrawNode } from './pkg/draw_browser_wasm.js'
 import '@excalidraw/excalidraw/index.css'
 
@@ -27,7 +26,7 @@ type PageKind = 'board' | 'letter' | 'daily'
 type FormatTab = 'board' | 'letters' | 'daily'
 type PageMeta = { id: string; name: string; kind: PageKind; createdAt: number; updatedAt: number }
 type DocMeta = { id: string; owner: string | null; name: string; ticket?: string; updatedAt: number; pages: PageMeta[] }
-type PeerInfo = { nick: string; lastSeen: number; doc?: string | null }
+type PeerInfo = { nick: string; lastSeen: number; doc?: string | null; hasAccess?: boolean }
 
 const LS_SECRET = 'draw.secret'
 const LS_DOCS = 'draw.docs'
@@ -50,36 +49,26 @@ const snapKey = (doc: string, page: string) => `draw.snap.${doc}.${page}`
 const filesKey = (doc: string, page: string) => `draw.files.${doc}.${page}`
 const legacySnapKey = (doc: string) => `draw.snap.${doc}`
 
-// Identity: stable per browser (localStorage) but derived per tab
-// (sessionStorage), so two tabs in the same browser get distinct endpoint
-// IDs and can gossip with each other. Same-tab reloads keep their ID
-// (sessionStorage survives reload); cross-device stays distinct.
-const hexToBytes = (hex: string): Uint8Array => {
-  const clean = hex.trim().toLowerCase().replace(/^0x/, '')
-  const out = new Uint8Array(clean.length / 2)
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16)
-  return out
-}
+// Identity is per browser (localStorage base secret): closing tabs,
+// refreshing, or opening new tabs never changes who you are — ownership
+// survives all of it. Same-browser testing needs distinct ids, so
+// `?fresh=1` opts one tab into an ephemeral key (never stored).
 const bytesToHex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('')
 const randomHex = (n: number): string => {
   const b = new Uint8Array(n)
   crypto.getRandomValues(b)
   return bytesToHex(b)
 }
-const tabSecretHex = (): string => {
+const browserSecretHex = (): string => {
+  try {
+    if (new URLSearchParams(location.search).has('fresh')) return randomHex(32)
+  } catch {}
   let base = localStorage.getItem(LS_SECRET)
   if (!base || !/^[0-9a-fA-F]{64}$/.test(base.trim())) {
     base = randomHex(32)
     try { localStorage.setItem(LS_SECRET, base) } catch {}
   }
-  let tab = sessionStorage.getItem(SS_TAB)
-  if (!tab) {
-    tab = randomHex(8)
-    try { sessionStorage.setItem(SS_TAB, tab) } catch {}
-  }
-  const enc = new TextEncoder()
-  const input = new Uint8Array([...hexToBytes(base), ...enc.encode(tab)])
-  return bytesToHex(nacl.hash(input).slice(0, 32))
+  return base.trim()
 }
 
 const loadDocs = (): DocMeta[] => {
@@ -160,13 +149,38 @@ export default function App() {
   const lastPtr = useRef(0)
   const onlineRef = useRef<Record<string, string>>({})
   const peersRef = useRef<Record<string, PeerInfo>>(loadPeers())
-  // docId -> { ch, owner, live:Set<peerId> }
-  const rooms = useRef(new Map<string, { ch: any; owner: string | null; live: Map<string, number> }>())
+  // docId -> { ch, owner, live:Set<peerId>, fwVersion }
+  const rooms = useRef(new Map<string, { ch: any; owner: string | null; live: Map<string, number>; fwVersion: number }>())
   const activeRef = useRef<string | null>(null)
   const activePageRef = useRef<string | null>(null)
   const activeFormatRef = useRef<FormatTab>('board')
   const docsRef = useRef<DocMeta[]>(loadDocs())
   const sentVersions = useRef<Record<string, number>>({})
+
+  // ---- CRDT: LWW-element-map -------------------------------------------
+  // Per element id, the winner is max(version, ts, author). Deletes are
+  // tombstones (first-class entries), so a late snapshot can never resurrect
+  // a deleted element. Snapshots merge; they never replace.
+  // Working state is for the active page only; it is loaded/stored with the
+  // snapshot on page switches (draw.meta.<doc>.<page>, draw.tombs.<doc>.<page>).
+  type Entry = { v: number; ts: number; author: string }
+  const metaActive = useRef(new Map<string, Entry>())
+  const tombsActive = useRef(new Map<string, Entry>())
+  const knownIds = useRef(new Set<string>())
+  const dirtyTombs = useRef(new Map<string, Entry>())
+  const metaKey = (doc: string, page: string) => `draw.meta.${doc}.${page}`
+  const tombsKey = (doc: string, page: string) => `draw.tombs.${doc}.${page}`
+  const cmpEntry = (a: Entry, b: Entry): number =>
+    a.v !== b.v ? a.v - b.v : a.ts !== b.ts ? a.ts - b.ts : a.author < b.author ? -1 : a.author > b.author ? 1 : 0
+  // Best known claim for id: max(live meta, tombstone), or null if unknown.
+  const bestFor = (id: string): { entry: Entry; deleted: boolean } | null => {
+    const m = metaActive.current.get(id)
+    const t = tombsActive.current.get(id)
+    if (m && t) return cmpEntry(m, t) >= 0 ? { entry: m, deleted: false } : { entry: t, deleted: true }
+    if (m) return { entry: m, deleted: false }
+    if (t) return { entry: t, deleted: true }
+    return null
+  }
 
   const activeDocPages = (): PageMeta[] =>
     docsRef.current.find((d) => d.id === activeRef.current)?.pages ?? []
@@ -207,11 +221,60 @@ export default function App() {
   const touchPeer = (from: string, nickname: string, doc?: string | null) => {
     if (!from || from === me.current) return
     const prev = peersRef.current[from] ?? { nick: '', lastSeen: 0 }
-    const next = { ...peersRef.current, [from]: { nick: nickname || prev.nick || from.slice(0, 6), lastSeen: Date.now(), doc: doc ?? prev.doc ?? null } }
+    const entry: PeerInfo = { nick: nickname || prev.nick || from.slice(0, 6), lastSeen: Date.now(), doc: doc ?? prev.doc ?? null }
+    // Derive has_access from the firewall replica for the announced doc.
+    const pd = parsePresenceDoc(entry.doc)
+    if (pd.doc && rooms.current.has(pd.doc)) entry.hasAccess = queryAccess(pd.doc, from)
+    else entry.hasAccess = prev.hasAccess
+    const next = { ...peersRef.current, [from]: entry }
     setPeersBoth(next)
   }
 
   const activeCh = () => (activeRef.current ? rooms.current.get(activeRef.current)?.ch ?? null : null)
+
+  // has_access is derived from the local firewall replica — never stored
+  // as authority, only as a personal cached view (the PeerList rule).
+  const queryAccess = (roomId: string, peer: string): boolean | undefined => {
+    try {
+      const room = rooms.current.get(roomId)
+      if (!room) return undefined
+      return room.ch.has_access(peer) ?? undefined
+    } catch { return undefined }
+  }
+  const recomputeAccess = (roomId: string) => {
+    const next = { ...peersRef.current }
+    let changed = false
+    for (const [pid, p] of Object.entries(next)) {
+      const pd = parsePresenceDoc(p.doc)
+      if (pd.doc !== roomId) continue
+      const ha = queryAccess(roomId, pid)
+      if (ha !== undefined && ha !== p.hasAccess) { next[pid] = { ...p, hasAccess: ha }; changed = true }
+    }
+    if (changed) setPeersBoth(next)
+  }
+  // Owner broadcasts rule changes; receivers apply them wholesale. Only
+  // messages from the topic owner are honored (sender == owner), versioned
+  // by wall clock (prototype-grade ordering — see note below).
+  const broadcastFw = (roomId: string) => {
+    const room = rooms.current.get(roomId)
+    if (!room || room.owner !== me.current) return
+    try {
+      const snap = room.ch.firewall_snapshot()
+      room.fwVersion = Date.now()
+      bump('sent', 'fw')
+      room.ch.sender.broadcast(JSON.stringify({ from: me.current, epoch: epoch.current, seq: seq.current++, page: activePageRef.current ?? 'main', t: 'fw', v: room.fwVersion, snap })).catch(() => bump('sent', 'drop'))
+      recomputeAccess(roomId)
+    } catch {}
+  }
+  const setFwRule = (roomId: string, peer: string, allow: boolean) => {
+    const room = rooms.current.get(roomId)
+    if (!room || room.owner !== me.current) return
+    try {
+      if (allow) room.ch.allow_peer(peer)
+      else room.ch.revoke_peer(peer)
+      broadcastFw(roomId)
+    } catch (e) { setStatus(`firewall failed: ${e}`) }
+  }
 
   const sendMsg = (obj: any) => {
     const ch = activeCh()
@@ -222,9 +285,10 @@ export default function App() {
     ch.sender.broadcast(s).catch(() => bump('sent', 'drop'))
   }
 
-  // Merge elements into a background page's stored snapshot (id-merge,
-  // version wins) so pages you're not viewing still converge.
-  const mergePageSnapshot = (docId: string, page: string, elements: any[], files: any[]) => {
+  // Merge elements into a background page's stored snapshot by CRDT claim
+  // (version, ts, author) — never blind replace — so pages you're not
+  // viewing still converge without resurrection.
+  const mergePageSnapshot = (docId: string, page: string, elements: any[], meta: Record<string, [number, string]> | undefined, tombs: any[], files: any[]) => {
     try {
       if (Array.isArray(files) && files.length) {
         const fraw = localStorage.getItem(filesKey(docId, page))
@@ -232,15 +296,50 @@ export default function App() {
         for (const f of files) if (f?.id) fmap[f.id] = f
         try { localStorage.setItem(filesKey(docId, page), JSON.stringify(fmap)) } catch {}
       }
+      const mraw = localStorage.getItem(metaKey(docId, page))
+      const smeta: Record<string, Entry> = mraw ? JSON.parse(mraw) : {}
+      const traw = localStorage.getItem(tombsKey(docId, page))
+      const stombs: Record<string, Entry> = traw ? JSON.parse(traw) : {}
+      const bestStored = (id: string): { e: Entry; del: boolean } | null => {
+        const m = smeta[id]
+        const t = stombs[id]
+        if (m && t) return cmpEntry(m, t) >= 0 ? { e: m, del: false } : { e: t, del: true }
+        if (m) return { e: m, del: false }
+        if (t) return { e: t, del: true }
+        return null
+      }
+      if (Array.isArray(tombs)) for (const t of tombs) {
+        if (!t || typeof t.id !== 'string') continue
+        const cand: Entry = { v: t.v ?? 0, ts: t.ts ?? 0, author: t.author ?? '' }
+        const b = bestStored(t.id)
+        if (!b || cmpEntry(cand, b.e) > 0) {
+          stombs[t.id] = cand
+          delete smeta[t.id]
+        }
+      }
       const raw = localStorage.getItem(snapKey(docId, page))
       const cur = raw ? JSON.parse(raw) : []
       const map = new Map<string, any>()
       if (Array.isArray(cur)) for (const el of cur) map.set(el.id, el)
-      for (const el of elements) {
-        const prev = map.get(el.id)
-        if (!prev || (el.version ?? 0) >= (prev.version ?? 0)) map.set(el.id, el)
+      if (Array.isArray(elements)) for (const el of elements) {
+        const [ts, author] = meta?.[el.id] ?? [0, '']
+        const cand: Entry = { v: el.version ?? 0, ts, author }
+        const b = bestStored(el.id)
+        if (b && cmpEntry(b.e, cand) >= 0) continue
+        smeta[el.id] = cand
+        delete stombs[el.id]
+        map.set(el.id, el)
+      }
+      // Evict anything the tombstones condemn.
+      for (const [id, t] of Object.entries(stombs)) {
+        const el = map.get(id)
+        if (!el) continue
+        const m = smeta[id]
+        if (!m || cmpEntry(t, m) > 0) map.delete(id)
       }
       localStorage.setItem(snapKey(docId, page), JSON.stringify([...map.values()]))
+      try { localStorage.setItem(metaKey(docId, page), JSON.stringify(smeta)) } catch {}
+      try { localStorage.setItem(tombsKey(docId, page), JSON.stringify(stombs)) } catch {}
     } catch {}
   }
 
@@ -249,41 +348,91 @@ export default function App() {
     if (!a || !Array.isArray(elements)) return
     remote.current = true
     try {
-      if (asIs) {
-        a.updateScene({ elements: elements as OrderedExcalidrawElement[], commitToHistory: false })
-      } else {
-        a.updateScene({ elements: reconcileElements(a.getSceneElements(), elements, a.getAppState()) })
-      }
+      // Snapshots merge, never replace (CRDT rule — see header above).
+      a.updateScene({ elements: reconcileElements(a.getSceneElements(), elements as OrderedExcalidrawElement[], a.getAppState()) })
       for (const el of a.getSceneElements()) sentVersions.current[el.id] = el.version
+      // Only ids confirmed in our scene count as known: an onChange that
+      // runs between queueing and this apply must never tombstone
+      // not-yet-applied remote elements.
+      for (const el of a.getSceneElements() as any[]) knownIds.current.add(el.id)
+      enforceTombs()
     } finally {
       remote.current = false
     }
+  }
+
+  // Remove anything the tombstones condemn (runs inside the remote guard).
+  const enforceTombs = () => {
+    const a = apiRef.current
+    if (!a || !tombsActive.current.size) return
+    const condemned: string[] = []
+    for (const el of a.getSceneElements() as any[]) {
+      const t = tombsActive.current.get(el.id)
+      const m = metaActive.current.get(el.id)
+      if (t && (!m || cmpEntry(t, m) > 0)) condemned.push(el.id)
+    }
+    if (!condemned.length) return
+    const dead = new Set(condemned)
+    a.updateScene({
+      elements: (a.getSceneElements() as any[]).map((el) =>
+        dead.has(el.id) ? { ...el, isDeleted: true } : el,
+      ),
+    })
   }
 
   // Inbound coalescing: drawing messages can arrive at pointer-move rate.
   // Merge them and reconcile at most once per animation frame instead of
   // once per message (each reconcile is O(scene) — this is what lags after
   // ~10s of continuous strokes on a grown canvas).
-  const pendingRef = useRef<{ map: Map<string, any>; asIs: boolean } | null>(null)
+  // CRDT gate: an incoming element/tombstone only enters the pending set if
+  // it beats the best known claim for its id.
+  const pendingRef = useRef<{ map: Map<string, { el: any; ts: number; author: string }>; asIs: boolean } | null>(null)
   const rafRef = useRef(0)
+  const timerRef = useRef(0)
   const flushPending = () => {
-    rafRef.current = 0
+    if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = 0 }
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = 0 }
     const p = pendingRef.current
     pendingRef.current = null
     if (!p) return
-    applyRemote([...p.map.values()], p.asIs)
+    applyRemote([...p.map.values()].map((e) => e.el), p.asIs)
   }
-  const queueRemote = (elements: any[], asIs: boolean) => {
+  const queueRemote = (elements: any[], meta: Record<string, [number, string]> | undefined, asIs: boolean) => {
     const p = asIs || !pendingRef.current
-      ? { map: new Map<string, any>(), asIs }
+      ? { map: new Map<string, { el: any; ts: number; author: string }>(), asIs }
       : pendingRef.current!
     if (asIs) p.asIs = true
     for (const el of elements) {
+      const [ts, author] = meta?.[el.id] ?? [0, '']
+      const cand: Entry = { v: el.version ?? 0, ts, author }
+      const best = bestFor(el.id)
+      if (best && cmpEntry(best.entry, cand) >= 0) continue
+      metaActive.current.set(el.id, cand)
+      // A live element beating its tombstone buries it.
+      if (tombsActive.current.has(el.id)) tombsActive.current.delete(el.id)
       const prev = p.map.get(el.id)
-      if (!prev || (el.version ?? 0) >= (prev.version ?? 0)) p.map.set(el.id, el)
+      if (!prev || (el.version ?? 0) >= (prev.el.version ?? 0)) p.map.set(el.id, { el, ts, author })
     }
     pendingRef.current = p
-    if (!rafRef.current) rafRef.current = requestAnimationFrame(flushPending)
+    if (!rafRef.current && !timerRef.current) {
+      rafRef.current = requestAnimationFrame(flushPending)
+      timerRef.current = window.setTimeout(flushPending, 50)
+    }
+  }
+  const ingestTombs = (tombs: any[]): boolean => {
+    if (!Array.isArray(tombs) || !tombs.length) return false
+    let changed = false
+    for (const t of tombs) {
+      if (!t || typeof t.id !== 'string') continue
+      const cand: Entry = { v: t.v ?? 0, ts: t.ts ?? 0, author: t.author ?? '' }
+      const best = bestFor(t.id)
+      if (best && cmpEntry(best.entry, cand) >= 0) continue
+      tombsActive.current.set(t.id, cand)
+      if (metaActive.current.has(t.id)) metaActive.current.delete(t.id)
+      dirtyTombs.current.delete(t.id)
+      changed = true
+    }
+    return changed
   }
 
   const refreshOwnerLive = () => {
@@ -315,6 +464,23 @@ export default function App() {
     refreshOwnerLive()
   }
 
+  // Re-mint the stored ticket when mesh membership changes so it always
+  // carries current neighbors + their relays. Without this, a rejoin after
+  // churn dials a stale bootstrap (possibly only dead peers) and the mesh
+  // never reforms — browsers have no discovery to fall back on.
+  // Fire-and-forget: failures just leave the previous ticket in place.
+  const refreshTicket = (roomId: string) => {
+    ;(async () => {
+      try {
+        const room = rooms.current.get(roomId)
+        if (!room) return
+        const ticket = await room.ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
+        const docs = docsRef.current.map((d) => (d.id === roomId ? { ...d, ticket, updatedAt: Date.now() } : d))
+        setDocsBoth(docs)
+      } catch {}
+    })()
+  }
+
   const onRoomEvent = (roomId: string, ev: any) => {
     if (!ev || typeof ev.type !== 'string') return
     if (ev.type === 'presence') {
@@ -323,6 +489,7 @@ export default function App() {
     }
     if (ev.type === 'neighborUp') {
       setPresence(roomId, String(ev.endpoint_id ?? ev.endpointId ?? ''), '', null)
+      refreshTicket(roomId)
       return
     }
     if (ev.type === 'neighborDown') {
@@ -334,6 +501,7 @@ export default function App() {
         setOnline(rest)
       }
       refreshOwnerLive()
+      refreshTicket(roomId)
       return
     }
     if (ev.type === 'messageReceived') {
@@ -342,6 +510,20 @@ export default function App() {
       bump('recv', m?.t ?? '?')
       const from = String(ev.from ?? m.from ?? '')
       if (from === me.current) return
+      // Firewall rules replicate to every joined room, background or not:
+      // only the topic owner is honored, newest version wins.
+      if (m?.t === 'fw') {
+        const room = rooms.current.get(roomId)
+        const v = typeof m.v === 'number' ? m.v : 0
+        if (room && room.owner && from === room.owner && v > room.fwVersion && typeof m.snap === 'string') {
+          try {
+            room.ch.apply_firewall(m.snap)
+            room.fwVersion = v
+            recomputeAccess(roomId)
+          } catch {}
+        }
+        return
+      }
       // Ignore drawing traffic for background rooms (still track presence)
       if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'f' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'cursor' || m?.t === 'pages')) return
       // Page tag (absent = legacy client on the default page).
@@ -359,8 +541,23 @@ export default function App() {
       }
       if (m?.t === 'f') {
         if (isActivePage) ingestFiles(m.files)
-        else mergePageSnapshot(roomId, msgPage, [], m.files ?? [])
+        else mergePageSnapshot(roomId, msgPage, [], undefined, [], m.files ?? [])
         return
+      }
+      // CRDT ingest helper: tombstones first (they condemn), then elements.
+      // After ingesting, enforce against the live scene under the remote guard.
+      const ingestCrdt = (elements: any[] | undefined, meta: any, tombs: any[]) => {
+        let touched = false
+        if (ingestTombs(tombs)) touched = true
+        if (Array.isArray(elements) && elements.length) {
+          const before = pendingRef.current?.map.size ?? -1
+          queueRemote(elements, meta, false)
+          touched = touched || (pendingRef.current?.map.size ?? -1) !== before
+        }
+        if (touched) {
+          remote.current = true
+          try { enforceTombs() } finally { remote.current = false }
+        }
       }
       if (m?.t === 'p') {
         if (typeof m.seq === 'number' && m.from) {
@@ -370,17 +567,24 @@ export default function App() {
         }
         if (isActivePage) {
           if (Array.isArray(m.files)) ingestFiles(m.files)
-          if (Array.isArray(m.elements)) queueRemote(m.elements, false)
+          ingestCrdt(m.elements, m.meta, m.tombs ?? [])
         } else if (Array.isArray(m.elements)) {
-          mergePageSnapshot(roomId, msgPage, m.elements, m.files ?? [])
+          mergePageSnapshot(roomId, msgPage, m.elements, m.meta, m.tombs ?? [], m.files ?? [])
+        } else if (Array.isArray(m.tombs)) {
+          mergePageSnapshot(roomId, msgPage, [], undefined, m.tombs, m.files ?? [])
         }
       } else if (m?.t === 'snap-req') {
         // Answer with elements + their binaries (forced: the requester is
         // usually a newcomer who missed the original file broadcasts).
         // Honors the requested page; falls back to our active page.
+        // Snapshots carry CRDT claims (meta + tombstones) so the joiner
+        // merges instead of replacing — no resurrection, no clobber.
         const want = typeof m.page === 'string' && m.page !== (activePageRef.current ?? 'main') ? m.page : null
+        const pg = want ?? activePageRef.current ?? 'main'
         let els: any[]
         let files: any[]
+        let meta: Record<string, [number, string]> = {}
+        let tombs: any[] = []
         if (want) {
           try {
             const raw = localStorage.getItem(snapKey(roomId, want))
@@ -390,25 +594,38 @@ export default function App() {
             const fraw = localStorage.getItem(filesKey(roomId, want))
             files = Object.values(fraw ? JSON.parse(fraw) : {})
           } catch { files = [] }
+          try {
+            const mraw = localStorage.getItem(metaKey(roomId, want))
+            meta = mraw ? JSON.parse(mraw) : {}
+          } catch {}
+          try {
+            const traw = localStorage.getItem(tombsKey(roomId, want))
+            const tm = traw ? JSON.parse(traw) : {}
+            tombs = Object.entries(tm).map(([id, e]: any) => ({ id, v: e.v, ts: e.ts, author: e.author }))
+          } catch {}
         } else {
           els = apiRef.current?.getSceneElements() ?? []
           files = collectFilesFor(els, true)
+          for (const [id, e] of metaActive.current) meta[id] = [e.ts, e.author]
+          tombs = [...tombsActive.current.entries()].map(([id, e]) => ({ id, v: e.v, ts: e.ts, author: e.author }))
         }
         if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
-          sendMsg({ t: 'snap', elements: els, files, page: want ?? activePageRef.current ?? 'main' })
+          sendMsg({ t: 'snap', elements: els, meta, tombs, files, page: pg })
         } else {
-          sendMsg({ t: 'snap', elements: els, page: want ?? activePageRef.current ?? 'main' })
+          sendMsg({ t: 'snap', elements: els, meta, tombs, page: pg })
           for (const f of files) {
             if (JSON.stringify(f).length > MAX_MSG) continue
-            sendMsg({ t: 'f', files: [f], page: want ?? activePageRef.current ?? 'main' })
+            sendMsg({ t: 'f', files: [f], page: pg })
           }
         }
       } else if (m?.t === 'snap') {
         if (isActivePage) {
           if (Array.isArray(m.files)) ingestFiles(m.files)
-          if (Array.isArray(m.elements)) queueRemote(m.elements, true)
+          ingestCrdt(m.elements, m.meta, m.tombs ?? [])
         } else if (Array.isArray(m.elements)) {
-          mergePageSnapshot(roomId, msgPage, m.elements, m.files ?? [])
+          mergePageSnapshot(roomId, msgPage, m.elements, m.meta, m.tombs ?? [], m.files ?? [])
+        } else if (Array.isArray(m.tombs)) {
+          mergePageSnapshot(roomId, msgPage, [], undefined, m.tombs, m.files ?? [])
         }
       }
     }
@@ -449,6 +666,17 @@ export default function App() {
         if (raw && raw !== '[]') { setSaveInfo(`held snapshot ${new Date().toLocaleTimeString()} (canvas empty)`); return }
       }
       localStorage.setItem(key, JSON.stringify(els))
+      // Persist CRDT claims alongside (best-effort like the rest here).
+      try {
+        const m: Record<string, Entry> = {}
+        for (const [id, e] of metaActive.current) m[id] = e
+        localStorage.setItem(metaKey(roomId, pg), JSON.stringify(m))
+      } catch {}
+      try {
+        const t: Record<string, Entry> = {}
+        for (const [id, e] of tombsActive.current) t[id] = e
+        localStorage.setItem(tombsKey(roomId, pg), JSON.stringify(t))
+      } catch {}
       // Persist image binaries alongside (best-effort: quota may refuse).
       try {
         const files = apiRef.current?.getFiles() ?? {}
@@ -482,12 +710,36 @@ export default function App() {
           for (const f of arr as any[]) if (f?.id) sentFiles.current.add(f.id)
         }
       } catch {}
+      // CRDT working state for this page.
+      metaActive.current = new Map()
+      tombsActive.current = new Map()
+      dirtyTombs.current.clear()
+      try {
+        const mraw = localStorage.getItem(metaKey(roomId, pg))
+        const m = mraw ? JSON.parse(mraw) : {}
+        for (const [id, e] of Object.entries(m)) metaActive.current.set(id, e as Entry)
+      } catch {}
+      try {
+        const traw = localStorage.getItem(tombsKey(roomId, pg))
+        const t = traw ? JSON.parse(traw) : {}
+        for (const [id, e] of Object.entries(t)) tombsActive.current.set(id, e as Entry)
+      } catch {}
       const raw = localStorage.getItem(snapKey(roomId, pg))
       const els = raw ? JSON.parse(raw) : []
       if (Array.isArray(els)) {
         remote.current = true
         try { apiRef.current.updateScene({ elements: els, commitToHistory: false }) } finally { remote.current = false }
         for (const el of apiRef.current.getSceneElements()) sentVersions.current[el.id] = el.version
+        knownIds.current = new Set((apiRef.current.getSceneElements() as any[]).map((el) => el.id))
+        // Seed live claims for restored elements lacking stored meta
+        // (legacy snapshots): our load counts as an observation, not an edit.
+        for (const el of apiRef.current.getSceneElements() as any[]) {
+          if (!metaActive.current.has(el.id) && !tombsActive.current.has(el.id)) {
+            metaActive.current.set(el.id, { v: el.version ?? 0, ts: 0, author: '' })
+          }
+        }
+        remote.current = true
+        try { enforceTombs() } finally { remote.current = false }
         restored.current.add(`${roomId}/${pg}`)
         setSaveInfo(`restored ${els.length} els ${new Date().toLocaleTimeString()}`)
       }
@@ -550,6 +802,12 @@ export default function App() {
     sentVersions.current = {}
     sentFiles.current = new Set()
     dirtyFilesRef.current.clear()
+    // CRDT working state is per page; the incoming page reloads its own.
+    metaActive.current = new Map()
+    tombsActive.current = new Map()
+    dirtyTombs.current.clear()
+    knownIds.current = new Set()
+    pendingRef.current = null
     // restore this doc's last-viewed page (or its first page)
     const doc = docsRef.current.find((d) => d.id === roomId)
     const pages = doc?.pages?.length ? doc.pages : [mainPage()]
@@ -574,12 +832,17 @@ export default function App() {
     const roomId = activeRef.current
     if (!roomId || pageId === activePageRef.current) return
     flushDirty()
-    persistSnapshot(roomId)
-    activePageRef.current = null // park: outgoing persist/announce use explicit ids below
+    const outgoing = activePageRef.current ?? 'main'
+    persistSnapshot(roomId, outgoing)
+    activePageRef.current = null // park: announce uses explicit ids below
     cursors.current = {}
     sentVersions.current = {}
     sentFiles.current = new Set()
     dirtyFilesRef.current.clear()
+    metaActive.current = new Map()
+    tombsActive.current = new Map()
+    dirtyTombs.current.clear()
+    knownIds.current = new Set()
     pendingRef.current = null
     setActivePageBoth(roomId, pageId)
     applyStoredSnapshot(roomId, pageId)
@@ -667,7 +930,7 @@ export default function App() {
     const roomId: string = ch.id()
     const owner: string | null = (() => { try { return ch.owner?.() ?? null } catch { return null } })()
     if (!rooms.current.has(roomId)) {
-      rooms.current.set(roomId, { ch, owner, live: new Map() })
+      rooms.current.set(roomId, { ch, owner, live: new Map(), fwVersion: 0 })
       pumpRoom(roomId, ch)
     }
     // upsert doc meta (never clobber the local page list with an older one)
@@ -701,7 +964,7 @@ export default function App() {
     const owner: string = me.current
     rooms.current.set(roomId, { ch, owner, live: new Map() })
     pumpRoom(roomId, ch)
-    const ticket = ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
+    const ticket = await ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
     setDocsBoth([...docsRef.current, { id: roomId, owner, name: name.trim() || `Topic ${docsRef.current.length + 1}`, ticket, updatedAt: Date.now(), pages: [mainPage()] }])
     try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     switchDoc(roomId)
@@ -730,7 +993,7 @@ export default function App() {
       try {
         const DN: any = DrawNode
         const node = DN.spawn_with_key
-          ? await DN.spawn_with_key(tabSecretHex())
+          ? await DN.spawn_with_key(browserSecretHex())
           : await DN.spawn()
         if (dead) return
         nodeRef.current = node
@@ -748,7 +1011,9 @@ export default function App() {
           if (dead) return
           switchDoc(roomId)
           sendMsg({ t: 'snap-req' })
-          history.replaceState(null, '', location.pathname)
+          // Clear the ticket hash so refresh doesn't rejoin, but preserve
+          // the query string (?debug=1, ?fresh=1 live there).
+          history.replaceState(null, '', location.pathname + location.search)
         } else if (docsRef.current.length > 0 && docsRef.current[0].ticket) {
           // rejoin last doc(s) live: keep other documents live as well
           for (const d of docsRef.current) {
@@ -775,6 +1040,31 @@ export default function App() {
     return () => clearInterval(t)
   }, [])
 
+  // DEBUG-only console hook for the e2e sandbox (draw/add/delete/verify).
+  useEffect(() => {
+    if (!DEBUG) return
+    ;(window as any).__draw = {
+      scene: () => (apiRef.current?.getSceneElements() ?? []).map((el: any) => ({ id: el.id, type: el.type, v: el.version, del: !!el.isDeleted })),
+      addRect: () => {
+        const a = apiRef.current
+        if (!a) return null
+        const id = 'e2e-' + Math.random().toString(36).slice(2, 10)
+        const el = { id, type: 'rectangle', x: 100, y: 100, width: 200, height: 100, angle: 0, strokeColor: '#1e1e1e', backgroundColor: 'transparent', fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'solid', roughness: 1, opacity: 100, roundness: { type: 3 }, boundElements: [], link: null, locked: false, index: null, version: 1, versionNonce: Math.floor(Math.random() * 2 ** 31), isDeleted: false, groupIds: [], frameId: null } as any
+        a.updateScene({ elements: [...a.getSceneElements(), el] })
+        return id
+      },
+      del: (id: string) => {
+        const a = apiRef.current
+        if (!a) return
+        a.updateScene({ elements: (a.getSceneElements() as any[]).filter((el) => el.id !== id) })
+      },
+      meta: () => [...metaActive.current.entries()].map(([id, e]) => ({ id, ...e })),
+      tombs: () => [...tombsActive.current.entries()].map(([id, e]) => ({ id, ...e })),
+      stats: () => JSON.parse(JSON.stringify(stats.current)),
+    }
+    return () => { try { delete (window as any).__draw } catch {} }
+  }, [])
+
   // flush outbound drawing batches ~16/s
   useEffect(() => {
     const t = window.setInterval(flushDirty, 60)
@@ -792,6 +1082,17 @@ export default function App() {
       }
       if (changed) pushCollaborators()
       refreshOwnerLive()
+      // Expire the visible roster from the same liveness timestamps —
+      // gossip NeighborDown can lag death by ~30s, so without this the
+      // "live here" list lies long after a peer is gone.
+      const room = activeRef.current ? rooms.current.get(activeRef.current) : undefined
+      if (room) {
+        let rosterChanged = false
+        for (const k of Object.keys(onlineRef.current)) {
+          if (now - (room.live.get(k) ?? 0) > 12000) { delete onlineRef.current[k]; rosterChanged = true }
+        }
+        if (rosterChanged) setOnline({ ...onlineRef.current })
+      }
     }, 1000)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -848,24 +1149,35 @@ export default function App() {
     } catch {}
   }
   const flushDirty = () => {
-    if (!dirtyRef.current.size && !dirtyFilesRef.current.size) return
+    if (!dirtyRef.current.size && !dirtyFilesRef.current.size && !dirtyTombs.current.size) return
     if (!me.current || !activeCh()) return
-    if (!ownerIsLive()) return // owner offline → edits stop
     const els = [...dirtyRef.current.values()]
     dirtyRef.current.clear()
     const files = [...dirtyFilesRef.current.values()]
     dirtyFilesRef.current.clear()
-    if (!files.length) {
-      if (els.length) sendMsg({ t: 'p', elements: els })
+    const tombs = [...dirtyTombs.current.entries()].map(([id, e]) => ({ id, v: e.v, ts: e.ts, author: e.author }))
+    dirtyTombs.current.clear()
+    // Claim metadata rides alongside (compact): receivers merge by
+    // (version, ts, author) instead of trusting arrival order.
+    const meta: Record<string, [number, string]> = {}
+    for (const el of els) {
+      const m = metaActive.current.get(el.id)
+      if (m) meta[el.id] = [m.ts, m.author]
+    }
+    if (!files.length && !tombs.length) {
+      if (els.length) sendMsg({ t: 'p', elements: els, meta })
       return
     }
-    // Attach files inline when small; otherwise send elements first and
-    // follow with one 'f' message per file so nothing exceeds the cap.
-    const inline = JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG
+    const body = { t: 'p', elements: els, meta, tombs }
+    if (!files.length) {
+      sendMsg(body)
+      return
+    }
+    const inline = JSON.stringify(files).length + JSON.stringify(body).length < MAX_MSG
     if (inline) {
-      sendMsg({ t: 'p', elements: els, files })
+      sendMsg({ ...body, files })
     } else {
-      if (els.length) sendMsg({ t: 'p', elements: els })
+      if (els.length || tombs.length) sendMsg(body)
       for (const f of files) {
         if (JSON.stringify(f).length > MAX_MSG) {
           setStatus('image too large to sync (>180KB)')
@@ -878,11 +1190,16 @@ export default function App() {
 
   const onChange = (elements: readonly OrderedExcalidrawElement[], _appState: any, files: Record<string, any>) => {
     if (remote.current || !me.current || !activeCh()) return
-    if (!ownerLive) return // owner offline → edits stop (flush rechecks live)
+    const now = Date.now()
     let touched = false
+    const seen = new Set<string>()
     for (const el of elements as any[]) {
+      seen.add(el.id)
       if (sentVersions.current[el.id] === el.version) continue
       sentVersions.current[el.id] = el.version
+      metaActive.current.set(el.id, { v: el.version, ts: now, author: me.current })
+      if (tombsActive.current.has(el.id)) tombsActive.current.delete(el.id)
+      if (dirtyTombs.current.has(el.id)) dirtyTombs.current.delete(el.id)
       const prev = dirtyRef.current.get(el.id)
       if (!prev || el.version >= prev.version) dirtyRef.current.set(el.id, el)
       touched = true
@@ -893,6 +1210,21 @@ export default function App() {
         dirtyFilesRef.current.set(fid, files[fid])
       }
     }
+    // Vanished ids are deletes: mint tombstones so the delete converges
+    // instead of resurrecting from someone's snapshot later.
+    for (const id of knownIds.current) {
+      if (seen.has(id)) continue
+      const lastV = sentVersions.current[id] ?? metaActive.current.get(id)?.v ?? 0
+      const tomb: Entry = { v: lastV + 1, ts: now, author: me.current }
+      const best = bestFor(id)
+      if (!best || cmpEntry(tomb, best.entry) > 0) {
+        tombsActive.current.set(id, tomb)
+        if (metaActive.current.has(id)) metaActive.current.delete(id)
+        dirtyTombs.current.set(id, tomb)
+        touched = true
+      }
+    }
+    knownIds.current = seen
     if (touched && dirtyRef.current.size > 200) flushDirty() // backpressure: huge burst flushes early
   }
 
@@ -907,7 +1239,7 @@ export default function App() {
     const room = activeRef.current ? rooms.current.get(activeRef.current) : null
     if (!room) return
     try {
-      const ticket = room.ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
+      const ticket = await room.ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
       await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
       // refresh stored ticket
       const docs = docsRef.current.map((d) => (d.id === activeRef.current ? { ...d, ticket, updatedAt: Date.now() } : d))
@@ -949,11 +1281,6 @@ export default function App() {
   }
   const names = Object.values(online)
   const activeDoc = docs.find((d) => d.id === activeId)
-  // Hard edit lock: anyone may write while the owner is live, but when the
-  // owner is offline the canvas goes view-only. Without this, guests draw
-  // into a local fork that never syncs and gets clobbered on rejoin.
-  // (A real CRDT would remove the need for the lock — future work.)
-  const canEdit = !activeDoc || activeDoc.owner === id || !id || ownerLive
   const knownPeers = Object.entries(peers).sort((a, b) => b[1].lastSeen - a[1].lastSeen).slice(0, 12)
   const timeAgo = (ts: number) => {
     const s = Math.floor((Date.now() - ts) / 1000)
@@ -970,23 +1297,17 @@ export default function App() {
         onChange={onChange}
         onPointerUpdate={onPointerUpdate}
         isCollaborating
-        viewModeEnabled={!canEdit}
       />
       <button style={pill} onClick={() => setShowPanel((s) => !s)} title={status}>
         <span style={{ width: 10, height: 10, borderRadius: 999, background: connColor, display: 'inline-block' }} />
         ✦ live draw
         <span style={{ fontWeight: 400, opacity: 0.65, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {activeDoc ? `${activeDoc.name}${!ownerLive ? ' · owner offline' : ''}` : status}
+          {activeDoc ? `${activeDoc.name}` : status}
         </span>
       </button>
       {showPanel && (
       <div style={panel}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ live draw</div>
-        {!ownerLive && (
-          <div style={{ background: '#fff3cd', border: '1px solid #ffe08a', borderRadius: 8, padding: '4px 8px', marginBottom: 6 }}>
-            owner offline — view only
-          </div>
-        )}
         <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
           <button style={btn} onClick={createDoc}>+ topic</button>
           <button style={btn} onClick={() => setShowAdd((s) => !s)}>⤵ join</button>
@@ -1045,8 +1366,20 @@ export default function App() {
             {knownPeers.map(([pid, p]) => {
               const pd = parsePresenceDoc(p.doc)
               const pgName = pd.page ? (activeDocPages().find((x) => x.id === pd.page)?.name ?? pd.page.slice(0, 6)) : null
+              const onActiveDoc = pd.doc === activeId
+              const iOwn = !!activeDoc && activeDoc.owner === id
               return (
-                <div key={pid}>{p.nick} · {timeAgo(p.lastSeen)}{pd.doc ? ` · ${pd.doc.slice(0, 6)}` : ''}{pgName ? `/${pgName}` : ''}</div>
+                <div key={pid}>
+                  {p.nick} · {timeAgo(p.lastSeen)}{pd.doc ? ` · ${pd.doc.slice(0, 6)}` : ''}{pgName ? `/${pgName}` : ''}
+                  {p.hasAccess === false && <span style={{ color: '#e5484d' }}> · revoked</span>}
+                  {iOwn && onActiveDoc && (
+                    <button
+                      style={{ ...btn, padding: '1px 8px', fontSize: 11, margin: '0 0 0 6px' }}
+                      title={p.hasAccess === false ? 'allow back onto this doc' : 'revoke access to this doc'}
+                      onClick={() => activeId && setFwRule(activeId, pid, p.hasAccess === false)}
+                    >{p.hasAccess === false ? 'allow' : 'revoke'}</button>
+                  )}
+                </div>
               )
             })}
           </div>
