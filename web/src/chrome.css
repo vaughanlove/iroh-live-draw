@@ -1,0 +1,12 @@
+/* Hide Excalidraw chrome we replace with our own UI:
+   hamburger menu (top-left), collab button and library (top-right).
+   Drawing toolbar, zoom controls, and undo/redo stay. */
+.excalidraw [data-testid="main-menu-trigger"] {
+  display: none !important;
+}
+.excalidraw [data-testid="collab-button"] {
+  display: none !important;
+}
+.excalidraw .sidebar-trigger {
+  display: none !important;
+}

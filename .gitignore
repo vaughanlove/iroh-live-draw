@@ -19,3 +19,4 @@ web/dist/
 # e2e sandbox artifacts
 /e2e/logs/
 e2e/node_modules/
+/logs/
