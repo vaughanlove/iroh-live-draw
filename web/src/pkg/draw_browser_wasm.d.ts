@@ -79,6 +79,13 @@ export class DrawNode {
      */
     endpoint_id(): string;
     /**
+     * Fetch a full page snapshot straight from the keeper over a direct
+     * QUIC request (no gossip mesh needed). Returns the KeeperRes JSON:
+     * `{elements, meta, tombs, files, topic}`. Throws KeeperErr message
+     * when refused.
+     */
+    fetch_snapshot(keeper_id: string, relay: string, ticket: string, page: string): Promise<string>;
+    /**
      * Joins a drawing room.
      */
     join(ticket: string, nickname: string): Promise<Channel>;
@@ -100,8 +107,9 @@ export class DrawNode {
      * Spawns a gossip node with a stable identity.
      * Pass back the string from `secret_key()` (stored e.g. in localStorage)
      * to keep the same endpoint id across reloads.
+     * `relay`: your own relay URL — when set, the mesh uses only it.
      */
-    static spawn_with_key(existing?: string | null): Promise<DrawNode>;
+    static spawn_with_key(existing?: string | null, relay?: string | null): Promise<DrawNode>;
 }
 
 export class IntoUnderlyingByteSource {

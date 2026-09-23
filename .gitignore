@@ -20,3 +20,10 @@ web/dist/
 /e2e/logs/
 e2e/node_modules/
 /logs/
+
+# test + run logs (e2e chrome profiles, harness output, keeper data)
+*.log
+logs/
+**/logs/
+profiles/
+keeper-data/

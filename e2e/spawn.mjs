@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const APP_URL = process.env.APP_URL ?? 'http://192.168.1.233:8080';
+const KEEPER_QS = `keeper=${encodeURIComponent(APP_URL.replace(/:\d+$/, ':8081'))}`;
 const CHROME_BIN = process.env.CHROME_BIN ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const OUT_DIR = process.env.OUT_DIR ?? path.resolve('logs');
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -36,6 +37,11 @@ async function launch(profile) {
 }
 
 async function openTab(browser, name, url) {
+  // Every tab gets the keeper address (query override beats build env).
+  const u = new URL(url);
+  const k = new URLSearchParams(KEEPER_QS);
+  for (const [kk, vv] of k) u.searchParams.set(kk, vv);
+  url = u.toString();
   const page = await browser.newPage();
   page.on('console', (m) => {
     const t = m.text();
@@ -266,7 +272,6 @@ async function scenarioCrdt() {
     await sleep(2000);
     log('crdt', 'B lastPush:', await drawApi(B, 'lastPush'));
     await sleep(8000);
-    const sA2 = (await sceneIds(A)).sort();
     const sB2 = (await sceneIds(B)).sort();
     // Owner is parked on another format: B must equal the owner's STORED
     // board state, not the owner's live (letters) scene.
@@ -275,10 +280,70 @@ async function scenarioCrdt() {
     const boardPage = odoc.pages.find((p) => p.kind === 'board') ?? odoc.pages[0];
     const stored = JSON.parse((await drawApi(A, 'lsGet', `draw.snap.${odoc.id}.${boardPage.id}`)) ?? '[]').map((e) => e.id).sort();
     log('crdt', 'pull overwrote:', JSON.stringify(sB2) === JSON.stringify(stored), `owner-board:${JSON.stringify(stored)} B:${JSON.stringify(sB2)}`);
+    // 6. keeper serves while owner is offline: close everything, fresh
+    //    join with a FRESH ticket (refreshed tickets carry keeper + relays;
+    //    the scenario-start ticket predates them). Keeper answers.
+    const freshDocs = JSON.parse((await drawApi(B, 'lsGet', 'draw.docs')) ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
+    const ticket = freshDocs[0].ticket;
     await A.close();
     await B.close();
+    await sleep(2000);
+    const C = await openTab(browser, 'newcomer', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    await sleep(15000);
+    const sC = await sceneIds(C);
+    log('crdt', 'keeper served newcomer:', sC.length >= 2, JSON.stringify(sC));
+    log('crdt', 'fetchErr:', await drawApi(C, 'fetchErr'));
+    await C.close();
   } finally {
     await browser.close();
+  }
+  log('harness', 'done. log at', logFile);
+}
+
+async function scenarioKeeper() {
+  log('harness', 'APP_URL=', APP_URL);
+  // Separate browser profile for the newcomer — like MacBook vs iPad in
+  // reality. Same-profile tabs share localStorage, which cross-contaminates
+  // snapshots and rosters and lies to every assertion.
+  const { browser } = await launch('keeper-owner');
+  const { browser: other } = await launch('keeper-guest');
+  try {
+    const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
+    await sleep(8000);
+    await openPanel(A);
+    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    await sleep(6000);
+    const id1 = await drawApi(A, 'addRect');
+    const id2 = await drawApi(A, 'addRect');
+    await sleep(6000);
+    const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
+    const ticket = docs[0].ticket;
+    log('keeper-test', 'ticket bytes:', ticket.length);
+    await sleep(10000); // let keeper merge
+    await A.close();
+    await sleep(2000);
+    const C = await openTab(other, 'newcomer', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    for (let i = 0; i < 10; i++) {
+      await sleep(2000);
+      const d = await drawApi(C, 'diag');
+      const c = await drawApi(C, 'counts');
+      log('keeper-test', `t+${(i + 1) * 2}s scene=${d.scene} meta=${d.meta} tombs=${d.tombs} known=${d.known} counts=${JSON.stringify(c)}`);
+      if (d.scene > 0) break;
+    }
+    const sC = await sceneIds(C);
+    log('keeper-test', 'served with owner offline:', sC.includes(id1) && sC.includes(id2), JSON.stringify(sC));
+    log('keeper-test', 'fetchErr:', await drawApi(C, 'fetchErr'));
+    log('keeper-test', 'lastFetch:', await drawApi(C, 'lastFetch'));
+    log('keeper-test', 'flushCount:', await drawApi(C, 'flushCount'));
+    log('keeper-test', 'diag:', JSON.stringify(await drawApi(C, 'diag')));
+    log('keeper-test', 'meta:', JSON.stringify(await drawApi(C, 'meta')));
+    log('keeper-test', 'tombs:', JSON.stringify(await drawApi(C, 'tombs')));
+    log('keeper-test', 'usLog:', JSON.stringify(await drawApi(C, 'usLog')));
+    log('keeper-test', 'apiCalls:', JSON.stringify(await drawApi(C, 'apiCalls')));
+    await C.close();
+  } finally {
+    await browser.close();
+    await other.close();
   }
   log('harness', 'done. log at', logFile);
 }
@@ -286,4 +351,5 @@ async function scenarioCrdt() {
 const scenario = process.argv[2] ?? 'liveness';
 if (scenario === 'liveness') await scenarioLiveness();
 else if (scenario === 'crdt') await scenarioCrdt();
+else if (scenario === 'keeper') await scenarioKeeper();
 else throw new Error(`unknown scenario: ${scenario}`);

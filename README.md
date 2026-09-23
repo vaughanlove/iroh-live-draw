@@ -42,6 +42,25 @@ Hit **⧉ share** to copy a link for the current doc. Open it on the other devic
 
 State lives in the browser (localStorage per doc page). Refresh restores it. Clear-cache wipes it.
 
+## Keeper (always-on watch peer) + custom relay
+
+Two Railway services, one repo:
+
+- `relay/Dockerfile` — stock `n0computer/iroh-relay` plus a tiny entrypoint that renders config from `$PORT`. Railway terminates TLS, so the relay runs plain HTTP behind the proxy.
+- `keeper/` — a Rust binary that joins docs as a dumb cache. Browsers POST tickets to `POST /watch` on boot and doc switch, so the keeper rejoins everything automatically. It merges what it sees (same CRDT rules) and answers `snap-req` when the owner is offline. It never answers `pull` and never edits. Newcomers can also fetch snapshots straight from it over QUIC (no gossip mesh needed) when gossip is being difficult.
+
+Point a build at them with env (or `?relay=` / `?keeper=` query overrides, no rebuild needed):
+
+```sh
+VITE_RELAY_URL=https://<relay>.up.railway.app
+VITE_KEEPER_URL=https://<keeper>.up.railway.app
+VITE_KEEPER_TOKEN=...   # optional, must match keeper's KEEPER_TOKEN
+```
+
+Local dev defaults live in `web/.env.development` (keeper on :8081, n0 relays). Run the keeper locally with `cargo run -p keeper` (`LISTEN`, `KEEPER_DATA`, `KEEPER_SECRET`, `RELAY_URL`, `MAX_TOPICS` envs).
+
+Env needed on Railway: keeper gets `RELAY_URL` pointing at the relay service; browsers get the two public URLs above. Railway has no UDP ingress so QUIC address discovery is off — relay-routed traffic (everything browsers need) works fine.
+
 ## Future work
 
 - Automatic stroke to .typ file

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
 import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
 import { DrawNode } from './pkg/draw_browser_wasm.js'
@@ -111,6 +111,35 @@ const savePeers = (p: Record<string, PeerInfo>) => localStorage.setItem(LS_PEERS
 const DEBUG =
   (import.meta as any).env?.VITE_DEBUG === '1' ||
   new URLSearchParams(location.search).has('debug')
+// Custom relay (all mesh traffic) + keeper (always-on watch peer).
+// Empty = n0 defaults / no keeper. Both also accept `?relay=` / `?keeper=`
+// query overrides (handy for tests and for pointing a build at private infra
+// without rebuilding).
+const qs = new URLSearchParams(location.search)
+const RELAY_URL = (qs.get('relay') ?? (import.meta as any).env?.VITE_RELAY_URL ?? '').trim() || undefined
+const KEEPER_URL = (qs.get('keeper') ?? (import.meta as any).env?.VITE_KEEPER_URL ?? '').trim().replace(/\/$/, '') || undefined
+const KEEPER_TOKEN = ((import.meta as any).env?.VITE_KEEPER_TOKEN as string | undefined)?.trim() || undefined
+
+// Register a doc's ticket with the keeper so it joins as a watch peer.
+// Fire-and-forget: keeper down just means no cache until it's back.
+// The keeper's endpoint id comes back in the response and is stored for
+// direct snapshot fetches (no gossip mesh needed for those).
+const LS_KEEPER = 'draw.keeper'
+const registerWithKeeper = (ticket: string) => {
+  if (!KEEPER_URL || !ticket) return
+  try {
+    fetch(`${KEEPER_URL}/watch`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(KEEPER_TOKEN ? { 'x-keeper-token': KEEPER_TOKEN } : {}),
+      },
+      body: JSON.stringify({ ticket }),
+    }).then((r) => r.json()).then((j) => {
+      if (j?.keeper) { try { localStorage.setItem(LS_KEEPER, String(j.keeper)) } catch {} }
+    }).catch(() => {})
+  } catch {}
+}
 
 export default function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null)
@@ -151,8 +180,26 @@ export default function App() {
     times.current.push(Date.now())
   }
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
+  const usLog = useRef<string[]>([])
+  const US = (tag: string, scene: any) => {
+    const a = apiRef.current
+    if (!a) return
+    const before = (a.getSceneElements() as any[]).length
+    a.updateScene(scene)
+    const after = (a.getSceneElements() as any[]).length
+    usLog.current.push(`${tag}:${before}->${after}`)
+    if (usLog.current.length > 20) usLog.current.shift()
+  }
+  // (onApi stable callback is defined below, after its dependencies.)
   const restored = useRef<Set<string>>(new Set())
   const lastPush = useRef('none')
+  const fetchErr = useRef('none')
+  const lastFetch = useRef('none')
+  const vanishCount = useRef(0)
+  const persistCount = useRef(0)
+  const changeCount = useRef(0)
+  const lastSeenCount = useRef(-1)
+  const seenHist = useRef<number[]>([])
   const remote = useRef(false)
   const nodeRef = useRef<any>(null)
   const me = useRef('')
@@ -185,6 +232,29 @@ export default function App() {
   const dirtyTombs = useRef(new Map<string, Entry>())
   const metaKey = (doc: string, page: string) => `draw.meta.${doc}.${page}`
   const tombsKey = (doc: string, page: string) => `draw.tombs.${doc}.${page}`
+  // Vanished ids are deletes — but a single onChange reading is not
+  // trustworthy (a stale delivery racing an in-flight remote apply would
+  // murder fresh elements with our own authorship). So disappearance only
+  // stages a tombstone; a delayed re-scan of the LIVE scene confirms it.
+  // Real deletes are still missing then; stale readings self-heal.
+  const pendingVanish = useRef(new Map<string, { v: number }>())
+  const confirmVanish = () => {
+    const a = apiRef.current
+    if (!a) return
+    const now = Date.now()
+    const seen = new Set((a.getSceneElements() as any[]).map((el) => el.id))
+    for (const [id, { v }] of pendingVanish.current) {
+      if (seen.has(id)) { pendingVanish.current.delete(id); continue }
+      const tomb: Entry = { v, ts: now, author: me.current }
+      const best = bestFor(id)
+      if (!best || cmpEntry(tomb, best.entry) > 0) {
+        tombsActive.current.set(id, tomb)
+        if (metaActive.current.has(id)) metaActive.current.delete(id)
+        dirtyTombs.current.set(id, tomb)
+      }
+      pendingVanish.current.delete(id)
+    }
+  }
   const cmpEntry = (a: Entry, b: Entry): number =>
     a.v !== b.v ? a.v - b.v : a.ts !== b.ts ? a.ts - b.ts : a.author < b.author ? -1 : a.author > b.author ? 1 : 0
   // Best known claim for id: max(live meta, tombstone), or null if unknown.
@@ -246,6 +316,56 @@ export default function App() {
   }
 
   const activeCh = () => (activeRef.current ? rooms.current.get(activeRef.current)?.ch ?? null : null)
+
+  // Snapshots can vanish into a half-built mesh (late-joiner broadcast
+  // stall): if our scene is still empty seconds after requesting, ask
+  // again. Last resort is a direct QUIC fetch from the keeper, which needs
+  // no gossip mesh at all. All bounded — each step fires only if we're
+  // still on the same doc+page with an empty canvas.
+  const fetchFromKeeper = async (roomId: string, page: string) => {
+    try {
+      if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
+      if ((apiRef.current?.getSceneElements() ?? []).length > 0) return
+      const node = nodeRef.current
+      const keeperId = localStorage.getItem(LS_KEEPER)
+      const ticket = docsRef.current.find((d) => d.id === roomId)?.ticket
+      // Keeper shares our relay setup in every deployment that matters, so
+      // our own home relay is a sound fallback when none is configured.
+      const relay = RELAY_URL ?? node?.relay_url?.()
+      if (!node?.fetch_snapshot || !keeperId || !relay || !ticket) return
+      const json = await node.fetch_snapshot(keeperId, relay, ticket, page)
+      if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
+      const res = JSON.parse(json)
+      lastFetch.current = `els=${res.elements?.length ?? '?'} tombs=${res.tombs?.length ?? '?'}`
+      if (Array.isArray(res.files)) ingestFiles(res.files)
+      const els = Array.isArray(res.elements) ? res.elements : []
+      const tombs = Array.isArray(res.tombs) ? res.tombs : []
+      if (!els.length && !tombs.length) return
+      remote.current = true
+      try {
+        if (ingestTombs(tombs)) { /* enforced below */ }
+        if (els.length) queueRemote(els, res.meta, false)
+        enforceTombs()
+      } finally {
+        remote.current = false
+      }
+      setStatus('restored from keeper')
+    } catch (e) {
+      fetchErr.current = String(e).slice(0, 160)
+    }
+  }
+  const requestSnap = (roomId: string, page: string, attempt = 0) => {
+    if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
+    if ((apiRef.current?.getSceneElements() ?? []).length > 0) return
+    if (attempt >= 1) {
+      // Gossip retries didn't fill us: go direct to the keeper, which
+      // needs no mesh at all.
+      fetchFromKeeper(roomId, page)
+      return
+    }
+    sendMsg({ t: 'snap-req' })
+    window.setTimeout(() => requestSnap(roomId, page, attempt + 1), 6000)
+  }
 
   // has_access is derived from the local firewall replica — never stored
   // as authority, only as a personal cached view (the PeerList rule).
@@ -364,7 +484,7 @@ export default function App() {
     remote.current = true
     try {
       // Snapshots merge, never replace (CRDT rule — see header above).
-      a.updateScene({ elements: reconcileElements(a.getSceneElements(), elements as OrderedExcalidrawElement[], a.getAppState()) })
+      US('apply', { elements: reconcileElements(a.getSceneElements(), elements as OrderedExcalidrawElement[], a.getAppState()) })
       for (const el of a.getSceneElements()) sentVersions.current[el.id] = el.version
       // Only ids confirmed in our scene count as known: an onChange that
       // runs between queueing and this apply must never tombstone
@@ -388,7 +508,7 @@ export default function App() {
     }
     if (!condemned.length) return
     const dead = new Set(condemned)
-    a.updateScene({
+    US('tombs', {
       elements: (a.getSceneElements() as any[]).map((el) =>
         dead.has(el.id) ? { ...el, isDeleted: true } : el,
       ),
@@ -404,12 +524,14 @@ export default function App() {
   const pendingRef = useRef<{ map: Map<string, { el: any; ts: number; author: string }>; asIs: boolean } | null>(null)
   const rafRef = useRef(0)
   const timerRef = useRef(0)
+  const flushCount = useRef(0)
   const flushPending = () => {
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = 0 }
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = 0 }
     const p = pendingRef.current
     pendingRef.current = null
     if (!p) return
+    flushCount.current += 1
     applyRemote([...p.map.values()].map((e) => e.el), p.asIs)
   }
   const queueRemote = (elements: any[], meta: Record<string, [number, string]> | undefined, asIs: boolean) => {
@@ -650,7 +772,7 @@ export default function App() {
             const c = (m.meta as any)?.[el.id]
             metaActive.current.set(el.id, { v: el.version ?? 0, ts: c?.[0] ?? 0, author: c?.[1] ?? '' })
           }
-          apiRef.current.updateScene({ elements: m.elements as OrderedExcalidrawElement[], commitToHistory: false })
+          US('push', { elements: m.elements as OrderedExcalidrawElement[], commitToHistory: false })
           for (const el of apiRef.current.getSceneElements()) sentVersions.current[el.id] = el.version
           knownIds.current = new Set((apiRef.current.getSceneElements() as any[]).map((el: any) => el.id))
           enforceTombs()
@@ -745,6 +867,7 @@ export default function App() {
         if (raw && raw !== '[]') { setSaveInfo(`held snapshot ${new Date().toLocaleTimeString()} (canvas empty)`); return }
       }
       localStorage.setItem(key, JSON.stringify(els))
+      persistCount.current += 1
       // Persist CRDT claims alongside (best-effort like the rest here).
       try {
         const m: Record<string, Entry> = {}
@@ -807,7 +930,7 @@ export default function App() {
       const els = raw ? JSON.parse(raw) : []
       if (Array.isArray(els)) {
         remote.current = true
-        try { apiRef.current.updateScene({ elements: els, commitToHistory: false }) } finally { remote.current = false }
+        try { US('restore', { elements: els, commitToHistory: false }) } finally { remote.current = false }
         for (const el of apiRef.current.getSceneElements()) sentVersions.current[el.id] = el.version
         knownIds.current = new Set((apiRef.current.getSceneElements() as any[]).map((el) => el.id))
         // Seed live claims for restored elements lacking stored meta
@@ -904,7 +1027,10 @@ export default function App() {
     }
     setStatus('connected — draw!')
     refreshOwnerLive()
-    sendMsg({ t: 'snap-req' })
+    requestSnap(roomId, activePageRef.current ?? 'main')
+    // The selected document wakes the keeper.
+    const sel = docsRef.current.find((d) => d.id === roomId)
+    if (sel?.ticket) registerWithKeeper(sel.ticket)
   }
 
   const switchPage = (pageId: string) => {
@@ -929,7 +1055,7 @@ export default function App() {
     for (const [, r] of rooms.current) {
       try { r.ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     }
-    sendMsg({ t: 'snap-req' })
+    requestSnap(roomId, pageId)
     setStatus('connected — draw!')
   }
 
@@ -958,9 +1084,24 @@ export default function App() {
       isDeleted: false, groupIds: [], frameId: null,
     } as any
     remote.current = true
-    try { a.updateScene({ elements: [...a.getSceneElements(), frame] }) } finally { remote.current = false }
+    try { US('frame', { elements: [...a.getSceneElements(), frame] }) } finally { remote.current = false }
     try { a.scrollToContent([frame] as any, { animate: true } as any) } catch {}
   }
+
+  // Stable Excalidraw API callback (see note at apiRef): mount-only restore.
+  const apiCalls = useRef<string[]>([])
+  const onApi = useCallback((a: ExcalidrawImperativeAPI | null) => {
+    const first = apiRef.current !== a
+    apiCalls.current.push(`${Date.now() % 100000}:${first ? 'first' : 'repeat'}`)
+    if (apiCalls.current.length > 12) apiCalls.current.shift()
+    setApi(a)
+    apiRef.current = a
+    if (first && a && activeRef.current) {
+      applyStoredSnapshot(activeRef.current, activePageRef.current ?? 'main')
+      ensureLetterSurface(activeRef.current, activePageRef.current ?? 'main')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const createPage = (kind: PageKind, name?: string) => {
     const roomId = activeRef.current
@@ -1027,6 +1168,7 @@ export default function App() {
     else docs.push(entry)
     setDocsBoth(docs)
     try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
+    registerWithKeeper(ticketStr)
     return roomId
   }
 
@@ -1072,7 +1214,7 @@ export default function App() {
       try {
         const DN: any = DrawNode
         const node = DN.spawn_with_key
-          ? await DN.spawn_with_key(browserSecretHex())
+          ? await DN.spawn_with_key(browserSecretHex(), RELAY_URL)
           : await DN.spawn()
         if (dead) return
         nodeRef.current = node
@@ -1135,10 +1277,27 @@ export default function App() {
         if (!a) return
         a.updateScene({ elements: (a.getSceneElements() as any[]).filter((el) => el.id !== id) })
       },
+      collabPing: () => {
+        cursors.current['probe'] = { x: 1, y: 1, at: Date.now() }
+        pushCollaborators()
+      },
       meta: () => [...metaActive.current.entries()].map(([id, e]) => ({ id, ...e })),
       tombs: () => [...tombsActive.current.entries()].map(([id, e]) => ({ id, ...e })),
       stats: () => JSON.parse(JSON.stringify(stats.current)),
       lastPush: () => lastPush.current,
+      fetchErr: () => fetchErr.current,
+      lastFetch: () => lastFetch.current,
+      flushCount: () => flushCount.current,
+      apiCalls: () => apiCalls.current,
+      usLog: () => usLog.current,
+      counts: () => ({ vanish: vanishCount.current, persist: persistCount.current, flush: flushCount.current, changes: changeCount.current, lastSeen: lastSeenCount.current, seenHist: seenHist.current }),
+      diag: () => ({
+        meta: metaActive.current.size,
+        tombs: tombsActive.current.size,
+        known: knownIds.current.size,
+        pending: pendingRef.current ? pendingRef.current.map.size : -1,
+        scene: (apiRef.current?.getSceneElements() ?? []).length,
+      }),
       lsGet: (k: string) => { try { return localStorage.getItem(k) } catch { return null } },
     }
     return () => { try { delete (window as any).__draw } catch {} }
@@ -1268,6 +1427,10 @@ export default function App() {
   }
 
   const onChange = (elements: readonly OrderedExcalidrawElement[], _appState: any, files: Record<string, any>) => {
+    changeCount.current += 1
+    lastSeenCount.current = (elements as any[]).length
+    seenHist.current.push((elements as any[]).length)
+    if (seenHist.current.length > 12) seenHist.current.shift()
     if (remote.current || !me.current || !activeCh()) return
     const now = Date.now()
     let touched = false
@@ -1289,18 +1452,17 @@ export default function App() {
         dirtyFilesRef.current.set(fid, files[fid])
       }
     }
-    // Vanished ids are deletes: mint tombstones so the delete converges
-    // instead of resurrecting from someone's snapshot later.
+    // Vanished ids stage (never mint inline — see confirmVanish). A genuine
+    // local delete is still missing at the delayed re-scan of the live scene.
     for (const id of knownIds.current) {
-      if (seen.has(id)) continue
-      const lastV = sentVersions.current[id] ?? metaActive.current.get(id)?.v ?? 0
-      const tomb: Entry = { v: lastV + 1, ts: now, author: me.current }
-      const best = bestFor(id)
-      if (!best || cmpEntry(tomb, best.entry) > 0) {
-        tombsActive.current.set(id, tomb)
-        if (metaActive.current.has(id)) metaActive.current.delete(id)
-        dirtyTombs.current.set(id, tomb)
-        touched = true
+      if (seen.has(id)) {
+        if (pendingVanish.current.has(id)) pendingVanish.current.delete(id)
+        continue
+      }
+      if (!pendingVanish.current.has(id)) {
+        const lastV = sentVersions.current[id] ?? metaActive.current.get(id)?.v ?? 0
+        pendingVanish.current.set(id, { v: lastV + 1 })
+        window.setTimeout(confirmVanish, 500)
       }
     }
     knownIds.current = seen
@@ -1490,7 +1652,7 @@ export default function App() {
   return (
     <div style={{ position: 'fixed', inset: 0 }}>
       <Excalidraw
-        excalidrawAPI={(a) => { setApi(a); apiRef.current = a; if (activeRef.current) { applyStoredSnapshot(activeRef.current, activePageRef.current ?? 'main'); ensureLetterSurface(activeRef.current, activePageRef.current ?? 'main') } }}
+        excalidrawAPI={onApi}
         onChange={onChange}
         onPointerUpdate={onPointerUpdate}
         isCollaborating

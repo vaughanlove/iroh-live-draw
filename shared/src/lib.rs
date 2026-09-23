@@ -5,9 +5,10 @@ use std::{
 
 use anyhow::{Context, Result};
 pub use iroh::EndpointId;
-pub use iroh::{Endpoint, RelayUrl, SecretKey, TransportAddr};
+pub use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, TransportAddr};
+pub use iroh::protocol::DynProtocolHandler;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::{EndpointAddr, PublicKey, Signature, protocol::Router};
+use iroh::{PublicKey, Signature, protocol::Router};
 pub use iroh_gossip::proto::TopicId;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
@@ -26,6 +27,43 @@ use tracing::{debug, info, warn};
 
 pub const TOPIC_PREFIX: &str = "iroh-draw/0:";
 pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(5); // what is this?
+
+/// Direct serving protocol: newcomers fetch full page state from the keeper
+/// over a plain QUIC request/response (no gossip mesh needed). Frame format
+/// on both directions is u32-be length + bytes.
+pub const KEEPER_ALPN: &[u8] = b"iroh-draw-keeper/0";
+pub const KEEPER_MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// Request a page snapshot from the keeper. Ticket proves membership.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KeeperReq {
+    pub ticket: String,
+    pub page: String,
+}
+
+/// Full page state answer.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct KeeperRes {
+    pub elements: Vec<serde_json::Value>,
+    pub meta: std::collections::BTreeMap<String, (i64, String)>,
+    pub tombs: Vec<KeeperTomb>,
+    pub files: Vec<serde_json::Value>,
+    pub topic: String,
+}
+
+/// Why the keeper refused (also how it says so).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KeeperErr {
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KeeperTomb {
+    pub id: String,
+    pub v: i64,
+    pub ts: i64,
+    pub author: String,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DrawTicket {
@@ -177,6 +215,32 @@ impl Firewall {
     }
 }
 
+/// Length-prefixed frame IO for direct (non-gossip) protocols.
+pub async fn write_frame<W>(w: &mut W, bytes: &[u8]) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    w.write_u32(bytes.len() as u32).await?;
+    w.write_all(bytes).await?;
+    Ok(())
+}
+
+/// Read one frame, capped at [`KEEPER_MAX_FRAME`].
+pub async fn read_frame<R>(r: &mut R) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let len = r.read_u32().await? as usize;
+    if len > KEEPER_MAX_FRAME {
+        anyhow::bail!("frame too large: {len}");
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
 #[derive(Clone)]
 pub struct DrawNode {
     secret_key: SecretKey,
@@ -188,13 +252,29 @@ pub struct DrawNode {
 
 impl DrawNode {
     /// Spawns a gossip node.
-    pub async fn spawn(secret_key: Option<SecretKey>) -> Result<Self> {
+    /// `relay`: custom relay URL (e.g. your own iroh-relay). When set, the
+    /// endpoint uses ONLY it (RelayMode::Custom replaces the n0 defaults) —
+    /// tickets then advertise it and the whole mesh stops depending on n0.
+    /// None keeps the default n0 relays (dev / fallback).
+    /// `extra`: additional ALPN protocol handlers (e.g. the keeper's direct
+    /// serving protocol).
+    /// `firewall`: shared access-control state. Pass your own instance when
+    /// something outside gossip (like a direct serving protocol) must
+    /// enforce the same rules; otherwise `Firewall::default()`.
+    pub async fn spawn(
+        secret_key: Option<SecretKey>,
+        relay: Option<RelayUrl>,
+        firewall: Firewall,
+        extra: Vec<(Vec<u8>, Box<dyn DynProtocolHandler>)>,
+    ) -> Result<Self> {
         let secret_key = secret_key.unwrap_or_else(SecretKey::generate);
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key.clone())
-            .alpns(vec![GOSSIP_ALPN.to_vec()])
-            .bind()
-            .await?;
+            .alpns(vec![GOSSIP_ALPN.to_vec()]);
+        if let Some(url) = relay {
+            builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
+        }
+        let endpoint = builder.bind().await?;
 
         let endpoint_id = endpoint.id();
         info!("endpoint bound");
@@ -212,16 +292,18 @@ impl DrawNode {
             .max_message_size(1024 * 256)
             .spawn(endpoint.clone());
         info!("gossip spawned");
-        let router = Router::builder(endpoint)
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .spawn();
+        let mut router = Router::builder(endpoint);
+        for (alpn, handler) in extra {
+            router = router.accept(alpn, handler);
+        }
+        let router = router.accept(GOSSIP_ALPN, gossip.clone()).spawn();
         info!("router spawned");
         Ok(Self {
             gossip,
             router,
             secret_key,
             lookup,
-            firewall: Firewall::default(),
+            firewall,
         })
     }
 

@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 
 [workspace]
 resolver = "2"
-members = ["shared", "browser-wasm"]
+members = ["shared", "browser-wasm", "keeper"]
 
 [workspace.dependencies]
 # we define iroh dependencies here to make upgrading easier.
