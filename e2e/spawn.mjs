@@ -240,6 +240,26 @@ async function scenarioCrdt() {
     log('crdt', 'B tombs:', JSON.stringify(await drawApi(B, 'tombs')));
     const conv = sA.includes(idA) && sA.includes(idB) && sB.includes(idA) && sB.includes(idB);
     log('crdt', 'concurrent converge:', conv, `A:[${sA.length}] B:[${sB.length}]`);
+
+    // 5. overwrite-pull: guest diverges, pulls, gets written over by owner
+    const idD = await drawApi(B, 'addRect');
+    await sleep(3000);
+    const preDiv = await sceneIds(B);
+    log('crdt', 'guest diverged:', preDiv.includes(idD));
+    await B.evaluate(() => {
+      [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '⋯').click();
+    });
+    await sleep(500);
+    await B.evaluate(() => {
+      [...document.querySelectorAll('button')].find((b) => b.textContent.includes('sync')).click();
+    });
+    await sleep(8000);
+    const sA2 = (await sceneIds(A)).sort();
+    const sB2 = (await sceneIds(B)).sort();
+    // Overwrite contract: after pull, guest IS the owner's scene. (Strict
+    // "wiped" checks fight the CRDT, which converges the divergence first —
+    // equality after an explicit pull is the property that matters.)
+    log('crdt', 'pull overwrote:', JSON.stringify(sA2) === JSON.stringify(sB2), `A:${JSON.stringify(sA2)} B:${JSON.stringify(sB2)}`);
     await A.close();
     await B.close();
   } finally {

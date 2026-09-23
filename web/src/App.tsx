@@ -483,8 +483,10 @@ export default function App() {
   // churn dials a stale bootstrap (possibly only dead peers) and the mesh
   // never reforms — browsers have no discovery to fall back on.
   // Fire-and-forget: failures just leave the previous ticket in place.
-  const refreshTicket = (roomId: string) => {
-    ;(async () => {
+  // A delayed retry follows each change because relay addresses may not be
+  // in the endpoint map yet at the instant the neighbor event fires.
+  const refreshTicket = (roomId: string, delayed = false) => {
+    const run = async () => {
       try {
         const room = rooms.current.get(roomId)
         if (!room) return
@@ -492,7 +494,9 @@ export default function App() {
         const docs = docsRef.current.map((d) => (d.id === roomId ? { ...d, ticket, updatedAt: Date.now() } : d))
         setDocsBoth(docs)
       } catch {}
-    })()
+    }
+    run()
+    if (!delayed) window.setTimeout(run, 10000)
   }
 
   const onRoomEvent = (roomId: string, ev: any) => {
@@ -539,7 +543,7 @@ export default function App() {
         return
       }
       // Ignore drawing traffic for background rooms (still track presence)
-      if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'f' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'cursor' || m?.t === 'pages')) return
+      if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'f' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'pull' || m?.t === 'push' || m?.t === 'cursor' || m?.t === 'pages')) return
       // Page tag (absent = legacy client on the default page).
       const msgPage = typeof m.page === 'string' ? m.page : 'main'
       const isActivePage = msgPage === (activePageRef.current ?? 'main')
@@ -590,7 +594,6 @@ export default function App() {
       } else if (m?.t === 'snap-req') {
         // Answer with elements + their binaries (forced: the requester is
         // usually a newcomer who missed the original file broadcasts).
-        // Honors the requested page; falls back to our active page.
         // Snapshots carry CRDT claims (meta + tombstones) so the joiner
         // merges instead of replacing — no resurrection, no clobber.
         const want = typeof m.page === 'string' && m.page !== (activePageRef.current ?? 'main') ? m.page : null
@@ -632,6 +635,61 @@ export default function App() {
             sendMsg({ t: 'f', files: [f], page: pg })
           }
         }
+      } else if (m?.t === 'pull') {
+        // Manual sync: only the owner answers, with full state. The
+        // requester overwrites itself (see 'push') — no merging.
+        const room = rooms.current.get(roomId)
+        if (!room || (room.owner && room.owner !== me.current)) return
+        if (!isActivePage) return
+        const pg = activePageRef.current ?? 'main'
+        const els = apiRef.current?.getSceneElements() ?? []
+        const files = collectFilesFor(els, true)
+        const meta: Record<string, [number, string]> = {}
+        for (const [id, e] of metaActive.current) meta[id] = [e.ts, e.author]
+        const tombs = [...tombsActive.current.entries()].map(([id, e]) => ({ id, v: e.v, ts: e.ts, author: e.author }))
+        if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
+          sendMsg({ t: 'push', elements: els, meta, tombs, files, page: pg })
+        } else {
+          sendMsg({ t: 'push', elements: els, meta, tombs, page: pg })
+          for (const f of files) {
+            if (JSON.stringify(f).length > MAX_MSG) continue
+            sendMsg({ t: 'f', files: [f], page: pg })
+          }
+        }
+      } else if (m?.t === 'push') {
+        // Manual sync answer: only honored from the owner (or when no
+        // owner is recorded). Our scene is REPLACED wholesale — local
+        // unflushed edits are discarded, claims adopt the owner's.
+        const room = rooms.current.get(roomId)
+        if (!room || (room.owner && from !== room.owner)) return
+        if (!isActivePage || !apiRef.current || !Array.isArray(m.elements)) return
+        if (Array.isArray(m.files)) ingestFiles(m.files)
+        remote.current = true
+        try {
+          metaActive.current = new Map()
+          tombsActive.current = new Map()
+          if (Array.isArray(m.tombs)) for (const t of m.tombs) {
+            if (t?.id) tombsActive.current.set(t.id, { v: t.v ?? 0, ts: t.ts ?? 0, author: t.author ?? '' })
+          }
+          // Claims adopt the owner's; element versions seed from the pushed
+          // scene so future merges compare against real versions.
+          for (const el of m.elements as any[]) {
+            const c = (m.meta as any)?.[el.id]
+            metaActive.current.set(el.id, { v: el.version ?? 0, ts: c?.[0] ?? 0, author: c?.[1] ?? '' })
+          }
+          apiRef.current.updateScene({ elements: m.elements as OrderedExcalidrawElement[], commitToHistory: false })
+          for (const el of apiRef.current.getSceneElements()) sentVersions.current[el.id] = el.version
+          knownIds.current = new Set((apiRef.current.getSceneElements() as any[]).map((el: any) => el.id))
+          enforceTombs()
+          dirtyRef.current.clear()
+          dirtyFilesRef.current.clear()
+          dirtyTombs.current.clear()
+          pendingRef.current = null
+        } finally {
+          remote.current = false
+        }
+        persistSnapshot(roomId, msgPage)
+        setStatus('synced from owner')
       } else if (m?.t === 'snap') {
         if (isActivePage) {
           if (Array.isArray(m.files)) ingestFiles(m.files)
@@ -1483,8 +1541,8 @@ export default function App() {
         <div style={{ marginTop: 6 }}>
           <button disabled={!id || !activeId} style={btn} onClick={share}>⧉ share</button>
           <button style={btn} onClick={() => {
-            sendMsg({ t: 'snap-req' })
-            setStatus('reloading board…')
+            sendMsg({ t: 'pull' })
+            setStatus('pulling from owner…')
           }}>⟳ sync</button>
           <button style={btn} onClick={async () => {
             await copyText(JSON.stringify(apiRef.current?.getSceneElements() ?? []))

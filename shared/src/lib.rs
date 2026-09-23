@@ -270,7 +270,12 @@ impl DrawNode {
         nickname: String,
     ) -> Result<(ChatSender, BoxStream<Result<Event>>)> {
         let topic_id = ticket.topic_id;
-        let bootstrap = ticket.bootstrap.iter().cloned().collect();
+        let me = self.endpoint_id();
+        // Never dial ourselves: stored tickets accumulate our own id via
+        // re-sharing, and a self-dial failure poisons the topic's mesh
+        // state (observed as one-way broadcast stall after rejoins).
+        let bootstrap: Vec<EndpointId> =
+            ticket.bootstrap.iter().cloned().filter(|id| *id != me).collect();
         // Seed relay hints before subscribing so bootstrap dials resolve
         // without discovery.
         for (id, url) in &ticket.relays {
