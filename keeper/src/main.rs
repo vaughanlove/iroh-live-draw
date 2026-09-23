@@ -515,7 +515,10 @@ async fn main() -> anyhow::Result<()> {
         // (Pages / LAN IP) than the keeper. Tighten if this ever matters.
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(keeper);
-    let listen: SocketAddr = std::env::var("LISTEN").unwrap_or("0.0.0.0:8081".into()).parse()?;
+    let listen: SocketAddr = std::env::var("LISTEN")
+        .or_else(|_| std::env::var("PORT").map(|p| format!("0.0.0.0:{p}")))
+        .unwrap_or("0.0.0.0:8081".into())
+        .parse()?;
     info!(%listen, "keeper http online");
     axum::serve(tokio::net::TcpListener::bind(listen).await?, app).await?;
     Ok(())
