@@ -241,7 +241,17 @@ async function scenarioCrdt() {
     const conv = sA.includes(idA) && sA.includes(idB) && sB.includes(idA) && sB.includes(idB);
     log('crdt', 'concurrent converge:', conv, `A:[${sA.length}] B:[${sB.length}]`);
 
-    // 5. overwrite-pull: guest diverges, pulls, gets written over by owner
+    // 5. overwrite-pull: guest diverges, pulls, gets written over by owner.
+    // Owner parks on another format first: the answer must come from the
+    // owner's stored board state, not silence.
+    await A.evaluate(() => {
+      [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '⋯').click();
+    });
+    await sleep(500);
+    await A.evaluate(() => {
+      [...document.querySelectorAll('button')].find((b) => b.textContent.includes('letters')).click();
+    });
+    await sleep(2000);
     const idD = await drawApi(B, 'addRect');
     await sleep(3000);
     const preDiv = await sceneIds(B);
@@ -253,13 +263,18 @@ async function scenarioCrdt() {
     await B.evaluate(() => {
       [...document.querySelectorAll('button')].find((b) => b.textContent.includes('sync')).click();
     });
+    await sleep(2000);
+    log('crdt', 'B lastPush:', await drawApi(B, 'lastPush'));
     await sleep(8000);
     const sA2 = (await sceneIds(A)).sort();
     const sB2 = (await sceneIds(B)).sort();
-    // Overwrite contract: after pull, guest IS the owner's scene. (Strict
-    // "wiped" checks fight the CRDT, which converges the divergence first —
-    // equality after an explicit pull is the property that matters.)
-    log('crdt', 'pull overwrote:', JSON.stringify(sA2) === JSON.stringify(sB2), `A:${JSON.stringify(sA2)} B:${JSON.stringify(sB2)}`);
+    // Owner is parked on another format: B must equal the owner's STORED
+    // board state, not the owner's live (letters) scene.
+    const ownerDocs = JSON.parse((await drawApi(A, 'lsGet', 'draw.docs')) ?? '[]');
+    const odoc = ownerDocs.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    const boardPage = odoc.pages.find((p) => p.kind === 'board') ?? odoc.pages[0];
+    const stored = JSON.parse((await drawApi(A, 'lsGet', `draw.snap.${odoc.id}.${boardPage.id}`)) ?? '[]').map((e) => e.id).sort();
+    log('crdt', 'pull overwrote:', JSON.stringify(sB2) === JSON.stringify(stored), `owner-board:${JSON.stringify(stored)} B:${JSON.stringify(sB2)}`);
     await A.close();
     await B.close();
   } finally {

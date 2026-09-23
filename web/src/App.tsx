@@ -152,6 +152,7 @@ export default function App() {
   }
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
   const restored = useRef<Set<string>>(new Set())
+  const lastPush = useRef('none')
   const remote = useRef(false)
   const nodeRef = useRef<any>(null)
   const me = useRef('')
@@ -594,38 +595,12 @@ export default function App() {
       } else if (m?.t === 'snap-req') {
         // Answer with elements + their binaries (forced: the requester is
         // usually a newcomer who missed the original file broadcasts).
+        // Honors the requested page, live or stored; falls back to our own
+        // active page only when the message carries no usable tag.
         // Snapshots carry CRDT claims (meta + tombstones) so the joiner
         // merges instead of replacing — no resurrection, no clobber.
-        const want = typeof m.page === 'string' && m.page !== (activePageRef.current ?? 'main') ? m.page : null
-        const pg = want ?? activePageRef.current ?? 'main'
-        let els: any[]
-        let files: any[]
-        let meta: Record<string, [number, string]> = {}
-        let tombs: any[] = []
-        if (want) {
-          try {
-            const raw = localStorage.getItem(snapKey(roomId, want))
-            els = raw ? JSON.parse(raw) : []
-          } catch { els = [] }
-          try {
-            const fraw = localStorage.getItem(filesKey(roomId, want))
-            files = Object.values(fraw ? JSON.parse(fraw) : {})
-          } catch { files = [] }
-          try {
-            const mraw = localStorage.getItem(metaKey(roomId, want))
-            meta = mraw ? JSON.parse(mraw) : {}
-          } catch {}
-          try {
-            const traw = localStorage.getItem(tombsKey(roomId, want))
-            const tm = traw ? JSON.parse(traw) : {}
-            tombs = Object.entries(tm).map(([id, e]: any) => ({ id, v: e.v, ts: e.ts, author: e.author }))
-          } catch {}
-        } else {
-          els = apiRef.current?.getSceneElements() ?? []
-          files = collectFilesFor(els, true)
-          for (const [id, e] of metaActive.current) meta[id] = [e.ts, e.author]
-          tombs = [...tombsActive.current.entries()].map(([id, e]) => ({ id, v: e.v, ts: e.ts, author: e.author }))
-        }
+        const pg = typeof m.page === 'string' ? m.page : (activePageRef.current ?? 'main')
+        const { els, files, meta, tombs } = gatherPage(roomId, pg)
         if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
           sendMsg({ t: 'snap', elements: els, meta, tombs, files, page: pg })
         } else {
@@ -636,17 +611,13 @@ export default function App() {
           }
         }
       } else if (m?.t === 'pull') {
-        // Manual sync: only the owner answers, with full state. The
-        // requester overwrites itself (see 'push') — no merging.
+        // Manual sync: only the owner answers, with full state for the
+        // requested page (live or stored — the owner may be viewing
+        // elsewhere). The requester overwrites itself (see 'push').
         const room = rooms.current.get(roomId)
         if (!room || (room.owner && room.owner !== me.current)) return
-        if (!isActivePage) return
-        const pg = activePageRef.current ?? 'main'
-        const els = apiRef.current?.getSceneElements() ?? []
-        const files = collectFilesFor(els, true)
-        const meta: Record<string, [number, string]> = {}
-        for (const [id, e] of metaActive.current) meta[id] = [e.ts, e.author]
-        const tombs = [...tombsActive.current.entries()].map(([id, e]) => ({ id, v: e.v, ts: e.ts, author: e.author }))
+        const pg = typeof m.page === 'string' ? m.page : (activePageRef.current ?? 'main')
+        const { els, files, meta, tombs } = gatherPage(roomId, pg)
         if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
           sendMsg({ t: 'push', elements: els, meta, tombs, files, page: pg })
         } else {
@@ -661,8 +632,10 @@ export default function App() {
         // owner is recorded). Our scene is REPLACED wholesale — local
         // unflushed edits are discarded, claims adopt the owner's.
         const room = rooms.current.get(roomId)
-        if (!room || (room.owner && from !== room.owner)) return
-        if (!isActivePage || !apiRef.current || !Array.isArray(m.elements)) return
+        if (!room) { lastPush.current = 'ignored: no room'; return }
+        if (room.owner && from !== room.owner) { lastPush.current = `ignored: not owner (from ${String(from).slice(0, 6)} owner ${(room.owner ?? '').slice(0, 6)})`; return }
+        if (!isActivePage || !apiRef.current || !Array.isArray(m.elements)) { lastPush.current = 'ignored: wrong page/no api/bad elements'; return }
+        lastPush.current = `applied ${m.elements.length} els`
         if (Array.isArray(m.files)) ingestFiles(m.files)
         remote.current = true
         try {
@@ -701,6 +674,40 @@ export default function App() {
         }
       }
     }
+  }
+
+  // Gather a page's full state for snapshot/pull answers: the live scene
+  // when it's our active page, stored state otherwise.
+  const gatherPage = (roomId: string, page: string) => {
+    let els: any[]
+    let files: any[]
+    let meta: Record<string, [number, string]> = {}
+    let tombs: any[] = []
+    if (page === (activePageRef.current ?? 'main') && roomId === activeRef.current) {
+      els = apiRef.current?.getSceneElements() ?? []
+      files = collectFilesFor(els, true)
+      for (const [id, e] of metaActive.current) meta[id] = [e.ts, e.author]
+      tombs = [...tombsActive.current.entries()].map(([id, e]) => ({ id, v: e.v, ts: e.ts, author: e.author }))
+    } else {
+      try {
+        const raw = localStorage.getItem(snapKey(roomId, page))
+        els = raw ? JSON.parse(raw) : []
+      } catch { els = [] }
+      try {
+        const fraw = localStorage.getItem(filesKey(roomId, page))
+        files = Object.values(fraw ? JSON.parse(fraw) : {})
+      } catch { files = [] }
+      try {
+        const mraw = localStorage.getItem(metaKey(roomId, page))
+        meta = mraw ? JSON.parse(mraw) : {}
+      } catch {}
+      try {
+        const traw = localStorage.getItem(tombsKey(roomId, page))
+        const tm = traw ? JSON.parse(traw) : {}
+        tombs = Object.entries(tm).map(([id, e]: any) => ({ id, v: e.v, ts: e.ts, author: e.author }))
+      } catch {}
+    }
+    return { els, files, meta, tombs }
   }
 
   const pumpRoom = (roomId: string, ch: any) => {
@@ -1131,6 +1138,8 @@ export default function App() {
       meta: () => [...metaActive.current.entries()].map(([id, e]) => ({ id, ...e })),
       tombs: () => [...tombsActive.current.entries()].map(([id, e]) => ({ id, ...e })),
       stats: () => JSON.parse(JSON.stringify(stats.current)),
+      lastPush: () => lastPush.current,
+      lsGet: (k: string) => { try { return localStorage.getItem(k) } catch { return null } },
     }
     return () => { try { delete (window as any).__draw } catch {} }
   }, [])
