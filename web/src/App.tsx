@@ -326,10 +326,11 @@ export default function App() {
   // again. Last resort is a direct QUIC fetch from the keeper, which needs
   // no gossip mesh at all. All bounded — each step fires only if we're
   // still on the same doc+page with an empty canvas.
-  const fetchFromKeeper = async (roomId: string, page: string) => {
+  const fetchFromKeeper = async (roomId: string, page: string, force = false) => {
     try {
       if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
-      if ((apiRef.current?.getSceneElements() ?? []).length > 0) return
+      if (!apiRef.current) return
+      if (!force && (apiRef.current?.getSceneElements() ?? []).length > 0) return
       const node = nodeRef.current
       const keeperId = localStorage.getItem(LS_KEEPER)
       const ticket = docsRef.current.find((d) => d.id === roomId)?.ticket
@@ -594,7 +595,14 @@ export default function App() {
     if (from === me.current) return
     touchPeer(from, nickname, doc)
     const room = rooms.current.get(roomId)
+    // Owner returning after absence: pull the keeper for a fresh merge.
+    // This is the same join-a-stream event as reconnect/switch/refresh.
+    const wasOwnerAbsent = !!room?.owner && from === room.owner &&
+      Date.now() - (room.live.get(from) ?? 0) > 30000
     if (room) room.live.set(from, Date.now())
+    if (wasOwnerAbsent && roomId === activeRef.current) {
+      fetchFromKeeper(roomId, activePageRef.current ?? 'main', true)
+    }
     // Only surface presence for the active room's roster.
     // A peer counts as "in this doc" if their announced doc matches,
     // or if we heard them on this room's gossip channel (fallback).
@@ -1031,7 +1039,12 @@ export default function App() {
     }
     setStatus('connected — draw!')
     refreshOwnerLive()
-    requestSnap(roomId, activePageRef.current ?? 'main')
+    requestSnap(roomId, pg)
+    // Every join pulls the keeper's latest for this page and merges it —
+    // reconnect, room switch, and refresh are all the same event: someone
+    // joining a stream. Merge (never replace) so unsynced local edits
+    // survive alongside the keeper's truth.
+    fetchFromKeeper(roomId, pg, true)
     // The selected document wakes the keeper.
     const sel = docsRef.current.find((d) => d.id === roomId)
     if (sel?.ticket) registerWithKeeper(sel.ticket)
@@ -1060,6 +1073,7 @@ export default function App() {
       try { r.ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     }
     requestSnap(roomId, pageId)
+    fetchFromKeeper(roomId, pageId, true)
     setStatus('connected — draw!')
   }
 
