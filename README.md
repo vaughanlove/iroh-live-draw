@@ -1,6 +1,6 @@
 # p2p whiteboard with iroh
 
-*Experimental - there is no authentication. If someone knows your ticket, they can join as a peer. Does not work on Safari.*
+*Experimental - there is no authentication. If someone knows your ticket, they can join as a peer.*
 
 Inspired by wanting to integrate my tablet more deeply into my workflows.
 
@@ -8,7 +8,7 @@ A vite webserver with a excalidraw canvas paired with iroh running over wasm. Ir
 
 ![demo](./minidemo.gif)
 
-Docs are topics. A topic owns board (the classic endless excalidraw whiteboard), letters (paginated board that has a set size), and dailies (which are a single page). For now, one peer owns the doc and holds the source of truth; everyone else goes view-only when the owner drops.
+Docs are topics. A topic owns board (the classic endless excalidraw whiteboard), letters (paginated board that has a set size), and dailies (which are a single page). One peer owns the doc and holds the source of truth; anyone may draw, and the ⟳ sync button pulls the owner's full state over yours. Owners can revoke peers (firewall replicated to every node).
 
 ## Build 
 1. Have the wasm32-unknown-unknown target installed: `rustup target add wasm32-unknown-unknown`. I'm running an intel macbook, so Apple clang can't build ring for wasm - (in my case) use zig instead:
@@ -38,9 +38,9 @@ cargo run --  # serves web/dist (LISTEN=0.0.0.0:8080, WEB_DIR=web/dist)
 Dev alternative: `npm run dev` in web/. That turns on the debug drawer, save indicator, and clear-cache button (also available on any build with `?debug=1`).
 
 ## Connect
-Hit **⧉ share** to copy a link for the current doc. Open it on the other device and you're in the same topic. Draw - changes sync realtime (batched deltas over gossip, last-writer-wins). Paste an image and the binary follows the elements.
+Hit **⧉ share** to copy a link for the current doc. Open it on the other device and you're in the same topic. Draw - changes sync realtime (batched deltas over gossip, LWW-element-map CRDT with tombstones, so deletes converge and snapshots merge instead of clobbering). Paste an image and the binary follows the elements.
 
-State lives in the browser (localStorage per doc page). Refresh restores it. Clear-cache wipes it.
+State lives in the browser (localStorage per doc page: elements, CRDT claims, tombstones, files). Refresh restores it. Clear-cache wipes it.
 
 ## Keeper (always-on watch peer) + custom relay
 
@@ -57,13 +57,12 @@ VITE_KEEPER_URL=https://<keeper>.up.railway.app
 VITE_KEEPER_TOKEN=...   # optional, must match keeper's KEEPER_TOKEN
 ```
 
-Local dev defaults live in `web/.env.development` (keeper on :8081, n0 relays). Run the keeper locally with `cargo run -p keeper` (`LISTEN`, `KEEPER_DATA`, `KEEPER_SECRET`, `RELAY_URL`, `MAX_TOPICS` envs).
+Local dev defaults live in `web/.env.development` (keeper on :8081, n0 relays). Run the keeper locally with `cargo run -p keeper` (`LISTEN`, `KEEPER_DATA`, `KEEPER_TOKEN`, `RELAY_URL`, `MAX_TOPICS` envs).
 
 Env needed on Railway: keeper gets `RELAY_URL` pointing at the relay service; browsers get the two public URLs above. Railway has no UDP ingress so QUIC address discovery is off — relay-routed traffic (everything browsers need) works fine.
 
 ## Future work
 
 - Automatic stroke to .typ file
-- CRDT support
-- Identity management for allowlisting certain peers, or future agent connections
+- Tombstone GC via version vectors (per-sender seq already exists); extract the CRDT + identity layers into crates once converged
 - Experiment with DiffusionGemma or Jev generating AI-assisted strokes
