@@ -14,6 +14,8 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/keeper /keeper
 WORKDIR /data
-ENV LISTEN=0.0.0.0:8081 KEEPER_DATA=/data
+# NOTE: no LISTEN here — the keeper binds Railway's $PORT (see main.rs).
+# KEEPER_DATA defaults to /data (the workdir).
+ENV KEEPER_DATA=/data
 EXPOSE 8081
 ENTRYPOINT ["/keeper"]
