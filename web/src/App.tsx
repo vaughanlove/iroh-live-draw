@@ -118,7 +118,11 @@ const DEBUG =
 const qs = new URLSearchParams(location.search)
 const RELAY_URL = (qs.get('relay') ?? (import.meta as any).env?.VITE_RELAY_URL ?? '').trim() || undefined
 const KEEPER_URL = (qs.get('keeper') ?? (import.meta as any).env?.VITE_KEEPER_URL ?? '').trim().replace(/\/$/, '') || undefined
-const KEEPER_TOKEN = ((import.meta as any).env?.VITE_KEEPER_TOKEN as string | undefined)?.trim() || undefined
+const KEEPER_TOKEN = (
+  (import.meta as any).env?.VITE_KEEPER_TOKEN ??
+  (import.meta as any).env?.VITE_KEEPER_SECRET ??
+  ''
+).trim() || undefined
 
 // Register a doc's ticket with the keeper so it joins as a watch peer.
 // Fire-and-forget: keeper down just means no cache until it's back.
