@@ -15,9 +15,7 @@ export default defineRailway(() => {
     source: github("vaughanlove/iroh-live-draw", {
       branch: "master",
     }),
-    // Nixpacks Rust provider (no Dockerfile): build just the keeper binary.
-    build: "cargo build --release -p keeper",
-    start: "./target/release/keeper",
+    // Root Dockerfile (Nixpacks drops the binary from the runtime image).
     healthcheck: "/healthz",
     env: {
       // Railway injects PORT; keeper binds it when LISTEN is unset (see main.rs).
