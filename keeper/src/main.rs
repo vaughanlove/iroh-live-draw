@@ -12,10 +12,11 @@
 //! State is best-effort persisted as JSON; browsers re-register on every
 //! boot, so a restart heals automatically.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -125,6 +126,10 @@ struct WatchedDoc {
     epoch: String,
     seq: Mutex<u64>,
     fw_version: Mutex<i64>,
+    /// Last gossip traffic (any sender) — silence means our mesh leg died.
+    last_rx_ms: Mutex<u128>,
+    /// Every peer we've heard from (rejoin bootstrap candidates).
+    seen: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for WatchedDoc {
@@ -238,6 +243,8 @@ impl Keeper {
                 epoch: format!("k{}", rand_suffix()),
                 seq: Mutex::new(0),
                 fw_version: Mutex::new(0),
+                last_rx_ms: Mutex::new(now_ms()),
+                seen: Mutex::new(HashSet::new()),
             });
             entry.ticket = ticket_str.to_string();
             if let Some(pages) = restore {
@@ -255,6 +262,93 @@ impl Keeper {
         Ok(topic.to_string())
     }
 
+    /// Rejoin a topic whose mesh leg went silent, with an enriched ticket:
+    /// original bootstrap + every peer we've heard from + their current
+    /// relays. The old subscription is left running (duplicate merges are
+    /// idempotent); the fresh join dials everyone we know.
+    async fn rejoin_with_ticket(&self, topic: TopicId, ticket_str: &str) {
+        let Ok(ticket) = DrawTicket::deserialize(ticket_str) else { return };
+        if ticket.topic_id != topic {
+            return;
+        }
+        // Enrich bootstrap + relays from everything we've learned.
+        let mut bootstrap: HashSet<String> =
+            ticket.bootstrap.iter().map(|id| id.to_string()).collect();
+        let seen: Vec<String> = self
+            .docs
+            .lock()
+            .expect("poisoned")
+            .get(&topic)
+            .map(|d| d.seen.lock().expect("poisoned").iter().cloned().collect())
+            .unwrap_or_default();
+        for id in &seen {
+            bootstrap.insert(id.clone());
+        }
+        let mut ticket = ticket;
+        let mut relays = ticket.relays.clone();
+        for id_s in bootstrap {
+            let Ok(id) = id_s.parse() else { continue };
+            ticket.bootstrap.insert(id);
+            if relays.contains_key(&id) {
+                continue;
+            }
+            // Current relay, learned from the live connection if any.
+            if let Some(info) = self.node.endpoint().remote_info(id).await {
+                for addr in info.into_addrs() {
+                    if let draw_shared::TransportAddr::Relay(url) = addr.into_addr() {
+                        relays.insert(id, url);
+                        break;
+                    }
+                }
+            }
+        }
+        ticket.relays = relays;
+        let ticket_str = ticket.serialize();
+        let Ok((sender, receiver)) = self.node.join(&ticket, "keeper".to_string()).await else { return };
+        {
+            let mut docs = self.docs.lock().expect("poisoned");
+            if let Some(doc) = docs.get_mut(&topic) {
+                doc.sender = sender;
+                doc.ticket = ticket_str;
+                doc.epoch = format!("k{}", rand_suffix());
+                *doc.seq.lock().expect("poisoned") = 0;
+                *doc.last_rx_ms.lock().expect("poisoned") = now_ms();
+            } else {
+                return;
+            }
+        }
+        self.persist();
+        let keeper = self.clone();
+        tokio::spawn(async move {
+            keeper.pump(topic, receiver).await;
+        });
+        info!(%topic, "rejoined idle mesh leg");
+    }
+
+    /// Watchdog: topics silent too long with known peers get rejoined. This
+    /// is what heals the mesh after churn — browsers can't rediscover peers,
+    /// but the keeper (native endpoint, full address knowledge) can redial.
+    /// Thresholds via env for tests: IDLE_AFTER_SEC (default 90),
+    /// REJOIN_TICK_SEC (default 30).
+    async fn rejoin_idle(&self) {
+        let idle_after_ms: u128 =
+            std::env::var("IDLE_AFTER_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(90) * 1000;
+        let now = now_ms();
+        let stale: Vec<(TopicId, String)> = {
+            let docs = self.docs.lock().expect("poisoned");
+            docs.iter()
+                .filter(|(_, d)| {
+                    now.saturating_sub(*d.last_rx_ms.lock().expect("poisoned")) > idle_after_ms
+                        && !d.seen.lock().expect("poisoned").is_empty()
+                })
+                .map(|(t, d)| (*t, d.ticket.clone()))
+                .collect()
+        };
+        for (topic, ticket) in stale {
+            self.rejoin_with_ticket(topic, &ticket).await;
+        }
+    }
+
     async fn pump(
         &self,
         topic: TopicId,
@@ -266,6 +360,14 @@ impl Keeper {
                 Event::MessageReceived { from, text, .. } => {
                     if from.to_string() == self.me {
                         continue;
+                    }
+                    // Liveness bookkeeping for the idle-rejoin watchdog.
+                    {
+                        let docs = self.docs.lock().expect("poisoned");
+                        if let Some(doc) = docs.get(&topic) {
+                            *doc.last_rx_ms.lock().expect("poisoned") = now_ms();
+                            doc.seen.lock().expect("poisoned").insert(from.to_string());
+                        }
                     }
                     let Ok(m) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
                     if std::env::var("KEEPER_VERBOSE").is_ok() {
@@ -416,9 +518,12 @@ fn apply_fw_snapshot(node: &DrawNode, topic: TopicId, snap: &str) -> bool {
     true
 }
 
+fn now_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
 fn rand_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0).to_string()
+    (now_ms() % 1_000_000_000).to_string()
 }
 
 #[tokio::main]
@@ -496,13 +601,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Periodic snapshot persistence.
+    // Periodic snapshot persistence + idle mesh-leg rejoins.
     let saver = keeper.clone();
+    let tick_secs: u64 = std::env::var("REJOIN_TICK_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
         loop {
             tick.tick().await;
             saver.persist();
+            saver.rejoin_idle().await;
         }
     });
 

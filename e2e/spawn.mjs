@@ -45,11 +45,12 @@ async function openTab(browser, name, url) {
   const page = await browser.newPage();
   page.on('console', (m) => {
     const t = m.text();
-    if (/draw_shared|draw_browser|endpoint|gossip|joining|firewall|presence/i.test(t)) log(name, 'CONSOLE:', t.slice(0, 300));
+    if (/draw_shared|draw_browser|endpoint|gossip|joining|firewall|presence|stage-vanish|mint-tomb|onchange#|\[flow\]|merge-drop/i.test(t)) log(name, 'CONSOLE:', t.slice(0, 400));
   });
   page.on('pageerror', (e) => log(name, 'PAGEERROR:', String(e).slice(0, 300)));
   page.on('dialog', async (d) => { log(name, 'DIALOG:', d.message().slice(0, 80)); await d.accept('e2e-topic'); });
-  await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(2000);
   return page;
 }
 
@@ -170,7 +171,7 @@ async function scenarioLiveness() {
     // Same-id reconnect may leave the mesh half-built (stale gossip state
     // for the rebooted id). Reload the guest for a clean handshake.
     log('harness', 'reloading guest for clean handshake');
-    await B.reload({ waitUntil: 'networkidle2' });
+    await B.reload({ waitUntil: 'domcontentloaded' }); await sleep(2000);
     await sleep(15000);
     await openPeers(B);
     log('guest', 'panel after guest reload:', (await panelText(B)).replace(/\n/g, ' | ').slice(0, 800));
@@ -211,7 +212,9 @@ async function scenarioCrdt() {
     const g1 = await sceneIds(B);
     log('crdt', 'guest sees rect:', g1.includes(id1), `(guest has ${g1.length})`);
 
-    // 2. delete on owner -> disappears on guest, tombstone minted
+    // 2. delete on owner -> disappears on guest, tombstone minted.
+    // Deletion needs a foreground tab (renders must commit): like a user.
+    await A.bringToFront();
     await drawApi(A, 'del', id1);
     await sleep(8000);
     const g2 = await sceneIds(B);
@@ -222,7 +225,7 @@ async function scenarioCrdt() {
     // Re-navigate (not reload) so ?fresh=1&debug=1 and the ticket survive;
     // the app strips the hash after joining.
     const guestUrl = `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(docs[0].ticket)}`;
-    await B.goto(guestUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+    await B.goto(guestUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); await sleep(2000);
     await sleep(12000);
     const g3 = await sceneIds(B);
     log('crdt', 'no resurrection after reload:', !g3.includes(id1), `(guest has ${g3.length})`);
@@ -348,8 +351,69 @@ async function scenarioKeeper() {
   log('harness', 'done. log at', logFile);
 }
 
+async function scenarioRejoin() {
+  log('harness', 'APP_URL=', APP_URL);
+  const { browser } = await launch('rejoin-owner');
+  const other = (await launch('rejoin-guest')).browser;
+  try {
+    const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
+    await sleep(8000);
+    await openPanel(A);
+    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    await sleep(6000);
+    const idA = await drawApi(A, 'addRect');
+    const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
+    const ticket = docs[0].ticket;
+    const B = await openTab(other, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    await sleep(10000);
+    log('rejoin', 'both converged:', JSON.stringify(await sceneIds(A)), JSON.stringify(await sceneIds(B)));
+    log('rejoin', 'A apiCalls:', JSON.stringify(await drawApi(A, 'apiCalls')));
+    for (let i = 0; i < 3; i++) {
+      await sleep(2500);
+      log('rejoin', `A t+${(i + 1) * 2.5}s:`, JSON.stringify(await sceneIds(A)));
+    }
+    log('rejoin', 'A pre-close meta:', JSON.stringify(await drawApi(A, 'meta')));
+    log('rejoin', 'A pre-close tombs:', JSON.stringify(await drawApi(A, 'tombs')));
+    log('rejoin', 'A pre-close usLog:', JSON.stringify(await drawApi(A, 'usLog')));
+    log('rejoin', 'A pre-close diag:', JSON.stringify(await drawApi(A, 'diag')));
+    log('rejoin', 'A pre-close diag:', JSON.stringify(await drawApi(A, 'diag')));
+    // Owner leaves; guest draws alone.
+    await A.close();
+    await sleep(2000);
+    log('rejoin', 'pages after A.close:', (await browser.pages()).length);
+    const idB = await drawApi(B, 'addRect');
+    await sleep(8000);
+    log('rejoin', 'guest drew alone:', idB, JSON.stringify(await sceneIds(B)));
+    // Owner rejoins (same profile = same identity). The keeper watchdog
+    // needs a silence window first, so give the mesh time to heal.
+    const A2 = await openTab(browser, 'owner2', `${APP_URL}/?debug=1`);
+    await sleep(45000);
+    const sA2 = await sceneIds(A2);
+    const sB = await sceneIds(B);
+    log('rejoin', 'owner2 scene:', JSON.stringify(sA2), 'guest scene:', JSON.stringify(sB));
+    log('rejoin', 'edits survived:', sA2.includes(idA) && sA2.includes(idB));
+    log('rejoin', 'A2 meta:', JSON.stringify(await drawApi(A2, 'meta')));
+    log('rejoin', 'A2 tombs:', JSON.stringify(await drawApi(A2, 'tombs')));
+    log('rejoin', 'A2 usLog:', JSON.stringify(await drawApi(A2, 'usLog')));
+    log('rejoin', 'A2 lastFetch:', await drawApi(A2, 'lastFetch'));
+    log('rejoin', 'A2 fetchErr:', await drawApi(A2, 'fetchErr'));
+    log('rejoin', 'A2 stats:', JSON.stringify(await drawApi(A2, 'stats')));
+    log('rejoin', 'A2 apiCalls:', JSON.stringify(await drawApi(A2, 'apiCalls')));
+    log('rejoin', 'A2 sceneAll:', JSON.stringify(await drawApi(A2, 'sceneAll')));
+    log('rejoin', 'A2 counts:', JSON.stringify(await drawApi(A2, 'counts')));
+    log('rejoin', 'B meta:', JSON.stringify(await drawApi(B, 'meta')));
+    log('rejoin', 'B tombs:', JSON.stringify(await drawApi(B, 'tombs')));
+    await A2.close();
+    await B.close();
+  } finally {
+    await browser.close();
+    await other.close();
+  }
+  log('harness', 'done. log at', logFile);
+}
 const scenario = process.argv[2] ?? 'liveness';
 if (scenario === 'liveness') await scenarioLiveness();
 else if (scenario === 'crdt') await scenarioCrdt();
 else if (scenario === 'keeper') await scenarioKeeper();
+else if (scenario === 'rejoin') await scenarioRejoin();
 else throw new Error(`unknown scenario: ${scenario}`);
