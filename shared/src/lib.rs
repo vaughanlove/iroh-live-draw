@@ -28,6 +28,21 @@ use tracing::{debug, info, warn};
 pub const TOPIC_PREFIX: &str = "iroh-draw/0:";
 pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(5); // what is this?
 
+/// Strip the FQDN trailing dot iroh appends to every RelayUrl
+/// (`https://euc1-1.relay.n0.iroh.link./`). Browsers resolve the dotted
+/// form fine for DNS, but strict TLS stacks (WebKit — i.e. every iOS
+/// browser) reject the certificate, so every relay fetch and relay-routed
+/// dial fails there. Undotted works everywhere, so normalize at every
+/// boundary where a URL leaves our code toward the network.
+pub fn bare_relay_url(url: &RelayUrl) -> RelayUrl {
+    let s = url.to_string();
+    let Some((scheme, after)) = s.split_once("://") else { return url.clone() };
+    let host_end = after.find('/').unwrap_or(after.len());
+    let (host, tail) = after.split_at(host_end);
+    let bare = format!("{scheme}://{}{tail}", host.trim_end_matches('.'));
+    bare.parse().unwrap_or_else(|_| url.clone())
+}
+
 /// Direct serving protocol: newcomers fetch full page state from the keeper
 /// over a plain QUIC request/response (no gossip mesh needed). Frame format
 /// on both directions is u32-be length + bytes.
@@ -252,10 +267,13 @@ pub struct DrawNode {
 
 impl DrawNode {
     /// Spawns a gossip node.
-    /// `relay`: custom relay URL (e.g. your own iroh-relay). When set, the
-    /// endpoint uses ONLY it (RelayMode::Custom replaces the n0 defaults) —
-    /// tickets then advertise it and the whole mesh stops depending on n0.
-    /// None keeps the default n0 relays (dev / fallback).
+    /// `relay`: custom relay URL (e.g. your own iroh-relay). The mesh always
+    /// uses RelayMode::Custom — either your URL or our own copy of n0's
+    /// relay list. We never use iroh's dotted FQDN defaults: the trailing
+    /// dot breaks TLS hostname verification on strict stacks (WebKit —
+    /// i.e. every iOS browser), killing all relay traffic there while
+    /// Chromium tolerates it. See [`bare_relay_url`].
+    /// None keeps n0 relays (dev / fallback), undotted.
     /// `extra`: additional ALPN protocol handlers (e.g. the keeper's direct
     /// serving protocol).
     /// `firewall`: shared access-control state. Pass your own instance when
@@ -268,12 +286,20 @@ impl DrawNode {
         extra: Vec<(Vec<u8>, Box<dyn DynProtocolHandler>)>,
     ) -> Result<Self> {
         let secret_key = secret_key.unwrap_or_else(SecretKey::generate);
-        let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        let relay_map = match relay {
+            Some(url) => iroh::RelayMap::from(bare_relay_url(&url)),
+            None => iroh::RelayMap::try_from_iter([
+                "https://use1-1.relay.n0.iroh.link",
+                "https://usw1-1.relay.n0.iroh.link",
+                "https://euc1-1.relay.n0.iroh.link",
+                "https://aps1-1.relay.n0.iroh.link",
+            ])
+            .expect("static relay list"),
+        };
+        let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key.clone())
+            .relay_mode(iroh::RelayMode::Custom(relay_map))
             .alpns(vec![GOSSIP_ALPN.to_vec()]);
-        if let Some(url) = relay {
-            builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
-        }
         let endpoint = builder.bind().await?;
 
         let endpoint_id = endpoint.id();
@@ -329,7 +355,8 @@ impl DrawNode {
     }
 
     /// Our current home relay, if the endpoint has settled on one. Tickets
-    /// carry this so joiners can dial us without discovery.
+    /// carry this so joiners can dial us without discovery. Returned
+    /// undotted (see [`bare_relay_url`]).
     pub fn relay_url(&self) -> Option<RelayUrl> {
         self.router
             .endpoint()
@@ -337,7 +364,7 @@ impl DrawNode {
             .addrs
             .iter()
             .find_map(|a| match a {
-                TransportAddr::Relay(url) => Some(url.clone()),
+                TransportAddr::Relay(url) => Some(bare_relay_url(url)),
                 _ => None,
             })
     }
@@ -359,11 +386,11 @@ impl DrawNode {
         let bootstrap: Vec<EndpointId> =
             ticket.bootstrap.iter().cloned().filter(|id| *id != me).collect();
         // Seed relay hints before subscribing so bootstrap dials resolve
-        // without discovery.
+        // without discovery. Normalized undotted (see [`bare_relay_url`]).
         for (id, url) in &ticket.relays {
             let addr = EndpointAddr {
                 id: *id,
-                addrs: BTreeSet::from([TransportAddr::Relay(url.clone())]),
+                addrs: BTreeSet::from([TransportAddr::Relay(bare_relay_url(url))]),
             };
             self.lookup.add_endpoint_info(addr);
         }

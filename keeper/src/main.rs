@@ -550,8 +550,9 @@ async fn main() -> anyhow::Result<()> {
     let relay: Option<draw_shared::RelayUrl> = std::env::var("RELAY_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().parse())
-        .transpose()?;
+        .map(|s| s.trim().parse().map(|u| draw_shared::bare_relay_url(&u)))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("bad RELAY_URL: {e}"))?;
     let docs: Arc<Mutex<HashMap<TopicId, WatchedDoc>>> = Arc::new(Mutex::new(HashMap::new()));
     let owners: Arc<Mutex<HashMap<TopicId, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let firewall = draw_shared::Firewall::default();

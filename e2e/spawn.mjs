@@ -12,6 +12,7 @@ import path from 'node:path';
 
 const APP_URL = process.env.APP_URL ?? 'http://192.168.1.233:8080';
 const KEEPER_QS = `keeper=${encodeURIComponent(APP_URL.replace(/:\d+$/, ':8081'))}`;
+const RELAY_QS = process.env.RELAY_URL ? `relay=${encodeURIComponent(process.env.RELAY_URL)}` : null;
 const CHROME_BIN = process.env.CHROME_BIN ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const OUT_DIR = process.env.OUT_DIR ?? path.resolve('logs');
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -41,6 +42,10 @@ async function openTab(browser, name, url) {
   const u = new URL(url);
   const k = new URLSearchParams(KEEPER_QS);
   for (const [kk, vv] of k) u.searchParams.set(kk, vv);
+  if (RELAY_QS) {
+    const r = new URLSearchParams(RELAY_QS);
+    for (const [kk, vv] of r) u.searchParams.set(kk, vv);
+  }
   url = u.toString();
   const page = await browser.newPage();
   page.on('console', (m) => {
@@ -411,9 +416,44 @@ async function scenarioRejoin() {
   }
   log('harness', 'done. log at', logFile);
 }
+async function scenarioLive() {
+  log('harness', 'APP_URL=', APP_URL);
+  const { browser } = await launch('live-owner');
+  const { browser: other } = await launch('live-guest');
+  try {
+    const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
+    await sleep(8000);
+    await openPanel(A);
+    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    await sleep(6000);
+    const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
+    const ticket = docs[0].ticket;
+    const B = await openTab(other, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    await sleep(12000);
+    // A draws AFTER B joined.
+    const idA = await drawApi(A, 'addRect');
+    await sleep(10000);
+    const sB = await sceneIds(B);
+    log('live', 'late edit reached guest:', sB.includes(idA), JSON.stringify(sB));
+    log('live', 'B stats:', JSON.stringify(await drawApi(B, 'stats')));
+    // And the reverse direction.
+    const idB = await drawApi(B, 'addRect');
+    await sleep(10000);
+    const sA = await sceneIds(A);
+    log('live', 'late edit reached owner:', sA.includes(idB), JSON.stringify(sA));
+    log('live', 'A stats:', JSON.stringify(await drawApi(A, 'stats')));
+    await A.close();
+    await B.close();
+  } finally {
+    await browser.close();
+    await other.close();
+  }
+  log('harness', 'done. log at', logFile);
+}
 const scenario = process.argv[2] ?? 'liveness';
 if (scenario === 'liveness') await scenarioLiveness();
 else if (scenario === 'crdt') await scenarioCrdt();
 else if (scenario === 'keeper') await scenarioKeeper();
 else if (scenario === 'rejoin') await scenarioRejoin();
+else if (scenario === 'live') await scenarioLive();
 else throw new Error(`unknown scenario: ${scenario}`);

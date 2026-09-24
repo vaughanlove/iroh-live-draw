@@ -60,7 +60,10 @@ impl DrawNode {
         };
         let relay_url: Option<draw_shared::RelayUrl> = match relay {
             Some(s) if !s.trim().is_empty() => Some(
-                s.trim().parse().map_err(|e| JsError::new(&format!("bad relay url: {e}")))?,
+                s.trim()
+                    .parse::<draw_shared::RelayUrl>()
+                    .map(|u| draw_shared::bare_relay_url(&u))
+                    .map_err(|e| JsError::new(&format!("bad relay url: {e}")))?,
             ),
             _ => None,
         };
@@ -98,8 +101,11 @@ impl DrawNode {
     ) -> Result<String, JsError> {
         use draw_shared::{KEEPER_ALPN, KeeperReq};
         let id: EndpointId = keeper_id.trim().parse().map_err(|e| JsError::new(&format!("bad keeper id: {e}")))?;
-        let relay_url: draw_shared::RelayUrl =
-            relay.trim().parse().map_err(|e| JsError::new(&format!("bad relay url: {e}")))?;
+        let relay_url: draw_shared::RelayUrl = relay
+            .trim()
+            .parse::<draw_shared::RelayUrl>()
+            .map(|u| draw_shared::bare_relay_url(&u))
+            .map_err(|e| JsError::new(&format!("bad relay url: {e}")))?;
         let req = KeeperReq { ticket, page };
         let body = serde_json::to_vec(&req).map_err(|e| JsError::new(&e.to_string()))?;
         let conn = self
@@ -149,7 +155,10 @@ impl DrawNode {
         // after a while, so capturing the relay at NeighborUp time is the
         // only reliable way to keep re-shared tickets redialable.
         let relays = Arc::new(Mutex::new({
-            let mut m = ticket.relays.clone();
+            let mut m = BTreeMap::new();
+            for (id, url) in &ticket.relays {
+                m.insert(*id, draw_shared::bare_relay_url(url));
+            }
             if let Some(url) = self.0.relay_url() {
                 m.insert(self.0.endpoint_id(), url);
             }
@@ -219,6 +228,7 @@ fn learn_relay(endpoint: draw_shared::Endpoint, relays: Arc<Mutex<BTreeMap<Endpo
             if let Some(info) = endpoint.remote_info(id).await {
                 for addr in info.into_addrs() {
                     if let draw_shared::TransportAddr::Relay(url) = addr.into_addr() {
+                        let url = draw_shared::bare_relay_url(&url);
                         relays.lock().unwrap().insert(id, url);
                         return;
                     }
@@ -280,10 +290,11 @@ impl Channel {
             // lookup as fallback.
             let known = self.relays.lock().unwrap().get(&id).cloned();
             if let Some(url) = known {
-                ticket.relays.insert(id, url);
+                ticket.relays.insert(id, draw_shared::bare_relay_url(&url));
             } else if let Some(info) = self.endpoint.remote_info(id).await {
                 for addr in info.into_addrs() {
                     if let draw_shared::TransportAddr::Relay(url) = addr.into_addr() {
+                        let url = draw_shared::bare_relay_url(&url);
                         ticket.relays.insert(id, url.clone());
                         self.relays.lock().unwrap().insert(id, url);
                         break;
