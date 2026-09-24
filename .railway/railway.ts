@@ -14,8 +14,10 @@ export default defineRailway(() => {
   const keeper = service("keeper", {
     source: github("vaughanlove/iroh-live-draw", {
       branch: "master",
-      rootDirectory: "keeper",
     }),
+    // Nixpacks Rust provider (no Dockerfile): build just the keeper binary.
+    build: "cargo build --release -p keeper",
+    start: "./target/release/keeper",
     healthcheck: "/healthz",
     env: {
       // Railway injects PORT; keeper binds it when LISTEN is unset (see main.rs).
