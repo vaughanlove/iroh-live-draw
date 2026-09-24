@@ -9,6 +9,8 @@ export default defineRailway(() => {
       rootDirectory: "relay",
     }),
     healthcheck: "/healthz",
+    // Free plan mandates serverless (sleep on idle); unset fails deploys.
+    deploy: { sleepApplication: true },
   });
 
   const keeper = service("keeper", {
@@ -17,6 +19,8 @@ export default defineRailway(() => {
     }),
     // Root Dockerfile (Nixpacks drops the binary from the runtime image).
     healthcheck: "/healthz",
+    // Free plan mandates serverless (sleep on idle); unset fails deploys.
+    deploy: { sleepApplication: true },
     env: {
       // Railway injects PORT; keeper binds it when LISTEN is unset (see main.rs).
       // RELAY_URL + KEEPER_TOKEN are set after the first deploy, once the
