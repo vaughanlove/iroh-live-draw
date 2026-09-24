@@ -1476,10 +1476,25 @@ export default function App() {
     sendMsg({ t: 'cursor', x: payload.pointer.x, y: payload.pointer.y })
   }
 
+  // Tickets without relay hints are undialable (the exact
+  // "No addressing information available" failure). The home relay takes
+  // a few seconds to settle after boot, so wait for it before minting.
+  const awaitRelay = async (tries = 16) => {
+    for (let i = 0; i < tries; i++) {
+      try {
+        if (nodeRef.current?.relay_url?.()) return true
+      } catch {}
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    return false
+  }
+
   const share = async () => {
     const room = activeRef.current ? rooms.current.get(activeRef.current) : null
     if (!room) return
     try {
+      setStatus('waiting for relay…')
+      await awaitRelay()
       const ticket = await room.ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
       await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
       // refresh stored ticket
