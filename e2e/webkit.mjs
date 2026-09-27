@@ -22,13 +22,13 @@ try {
   A.on('console', clog('A'));
   const errors = [];
   A.on('pageerror', (e) => errors.push('A pageerror: ' + String(e).slice(0, 200)));
-  A.on('dialog', async (d) => { await d.accept('e2e-topic'); });
+  A.on('dialog', async (d) => { await d.accept('e2e-project'); });
   await A.goto(`${APP_URL}/?debug=1`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(8000);
-  // open topics overlay via pill, create topic
-  await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.includes('live draw')).click());
+  // open projects home via ← Projects, create project
+  await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '← Projects').click());
   await sleep(500);
-  await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ new topic').click());
+  await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ new project').click());
   await sleep(6000);
   const docs = await A.evaluate(() => JSON.parse(localStorage.getItem('draw.docs') ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt));
   if (!docs.length || !docs[0].ticket) throw new Error('no ticket, keys: ' + Object.keys(await A.evaluate(() => ({ ...localStorage }))).join(','));

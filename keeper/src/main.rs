@@ -284,7 +284,12 @@ impl Keeper {
         for id in &seen {
             bootstrap.insert(id.clone());
         }
+        // Invariant: never dial ourselves. Our id lands in re-shared
+        // tickets (minting includes self + neighbors, which includes us),
+        // so strip it here just like every other dial site.
+        bootstrap.remove(&self.me);
         let mut ticket = ticket;
+        ticket.bootstrap.retain(|id| id.to_string() != self.me);
         let mut relays = ticket.relays.clone();
         for id_s in bootstrap {
             let Ok(id) = id_s.parse() else { continue };

@@ -20,12 +20,18 @@ async function copyText(t: string) {
 }
 
 type PeerCursor = { x: number; y: number; at: number }
-// A doc is an overarching topic. It owns pages in three formats:
-// board (freeform), letter (formal, fixed geometry), daily (dated letters).
-type PageKind = 'board' | 'letter' | 'daily'
-type FormatTab = 'board' | 'letters' | 'daily'
-type PageMeta = { id: string; name: string; kind: PageKind; createdAt: number; updatedAt: number }
+// A project is the highest conceptual unit. Sharing links a peer to a
+// project (capabilities formalized in a future pass — basic logic only).
+// Inside a project live boards (freeform canvases) + highlights (dated
+// selections of board elements; a future project map just assembles these).
+type BoardMeta = { id: string; name: string; createdAt: number; updatedAt: number }
+// DocMeta/ProjectMeta share the same localStorage shape (draw.docs) so
+// existing data migrates forward; PageMeta is the legacy board shape.
+type PageKind = 'board'
+type FormatTab = 'board'
+type PageMeta = BoardMeta & { kind?: PageKind }
 type DocMeta = { id: string; owner: string | null; name: string; ticket?: string; updatedAt: number; pages: PageMeta[] }
+type Highlight = { id: string; boardId: string; elementIds: string[]; date: string; createdAt: number; note?: string }
 type PeerInfo = { nick: string; lastSeen: number; doc?: string | null; hasAccess?: boolean }
 
 const LS_SECRET = 'draw.secret'
@@ -35,17 +41,21 @@ const LS_PAGE = 'draw.activepage'
 const LS_ALIASES = 'draw.aliases'
 const SS_TAB = 'draw.tab'
 
-// US Letter at 96dpi — the writing surface for letter pages.
+// US Letter constants deprecated with letter pages (kept for reference).
 const LETTER_W = 816
 const LETTER_H = 1056
+void LETTER_W
+void LETTER_H
+const highlightsKey = (doc: string) => `draw.highlights.${doc}`
 
 const newPageId = () => 'pg' + Math.random().toString(36).slice(2, 10)
-const mainPage = (): PageMeta => ({ id: 'main', name: 'Board', kind: 'board', createdAt: 0, updatedAt: 0 })
+const newHighlightId = () => 'hl' + Math.random().toString(36).slice(2, 10)
+const mainPage = (): PageMeta => ({ id: 'main', name: 'Board', createdAt: 0, updatedAt: 0 })
 const todayName = () => new Date().toISOString().slice(0, 10)
-// Format tabs group pages: board | letters (formal pieces) | daily (dated).
-const formatOf = (p: PageMeta): FormatTab =>
-  p.kind === 'board' ? 'board' : p.kind === 'daily' ? 'daily' : 'letters'
-const isLetterKind = (k: PageKind) => k !== 'board'
+// Deprecated: letter/daily formats removed. All pages are boards now;
+// format helpers stay as no-op shims so old snapshots migrate cleanly.
+const formatOf = (_p: PageMeta): FormatTab => 'board'
+const isLetterKind = (_k: PageKind | string | undefined) => false
 const snapKey = (doc: string, page: string) => `draw.snap.${doc}.${page}`
 const filesKey = (doc: string, page: string) => `draw.files.${doc}.${page}`
 const legacySnapKey = (doc: string) => `draw.snap.${doc}`
@@ -76,7 +86,8 @@ const loadDocs = (): DocMeta[] => {
   let docs: DocMeta[] = []
   try { docs = JSON.parse(localStorage.getItem(LS_DOCS) ?? '[]') } catch { return [] }
   // Migrate: docs predate pages; give each a default board page and move
-  // its snapshot under the new per-page key. Docs predate kinds too.
+  // its snapshot under the new per-page key. Legacy letter/daily pages are
+  // folded into plain boards (kind dropped, content preserved).
   let migrated = false
   for (const d of docs) {
     if (!d.pages || !d.pages.length) {
@@ -95,6 +106,13 @@ const loadDocs = (): DocMeta[] => {
       } catch {}
       migrated = true
     }
+    // Strip legacy kinds so every page is a board.
+    for (const p of d.pages) {
+      if ((p as any).kind && (p as any).kind !== 'board') {
+        delete (p as any).kind
+        migrated = true
+      }
+    }
   }
   if (migrated) { try { localStorage.setItem(LS_DOCS, JSON.stringify(docs)) } catch {} }
   return docs
@@ -104,6 +122,15 @@ const loadPeers = (): Record<string, PeerInfo> => {
   try { return JSON.parse(localStorage.getItem(LS_PEERS) ?? '{}') } catch { return {} }
 }
 const savePeers = (p: Record<string, PeerInfo>) => localStorage.setItem(LS_PEERS, JSON.stringify(p))
+const loadHighlights = (docId: string): Highlight[] => {
+  try {
+    const v = JSON.parse(localStorage.getItem(highlightsKey(docId)) ?? '[]')
+    return Array.isArray(v) ? v : []
+  } catch { return [] }
+}
+const saveHighlights = (docId: string, h: Highlight[]) => {
+  try { localStorage.setItem(highlightsKey(docId), JSON.stringify(h)) } catch {}
+}
 
 // Developer UI (debug drawer, save indicator, cache reset) is only shown
 // with `npm run dev` (VITE_DEBUG via .env.development) or `?debug=1`.
@@ -145,6 +172,106 @@ const registerWithKeeper = (ticket: string) => {
   } catch {}
 }
 
+import { useState as useRolodexState, useRef as useRolodexRef } from 'react'
+
+// Rolodex drum: a vertical wheel of project cards you roll through with the
+// mouse wheel, trackpad, touch drag, or ↑/↓ buttons. The focused card sits
+// front-and-center; neighbors tilt back around the drum.
+function RolodexDeck({ cards, renderCard, newCard, onSelect }: {
+  cards: string[]
+  renderCard: (key: string, offset: number, front: boolean) => React.ReactNode
+  newCard: React.ReactNode
+  onSelect?: (key: string) => void
+}) {
+  const total = cards.length + 1 // trailing new/join card rides the drum too
+  const [idx, setIdx] = useRolodexState(0)
+  const touchY = useRolodexRef<number | null>(null)
+  const acc = useRolodexRef(0)
+  const roll = (dir: 1 | -1) =>
+    setIdx((i) => Math.min(total - 1, Math.max(0, i + dir)))
+  const onWheel = (e: React.WheelEvent) => {
+    acc.current += e.deltaY
+    if (Math.abs(acc.current) < 24) return
+    roll(acc.current > 0 ? 1 : -1)
+    acc.current = 0
+  }
+  const R = 260 // drum radius px
+  const SPREAD = 0.42 // radians between cards
+  const clickCard = (i: number) => {
+    if (i === idx && onSelect && i < cards.length) onSelect(cards[i])
+    else setIdx(i)
+  }
+  return (
+    <div style={{ display: 'flex', gap: 12, alignItems: 'stretch' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, justifyContent: 'center' }}>
+        <button style={{ background: '#eef0f6', color: '#1a1d26', border: '1px solid #00000014', borderRadius: 999, padding: '5px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => roll(-1)} title="roll up" disabled={idx <= 0}>↑</button>
+        <button style={{ background: '#eef0f6', color: '#1a1d26', border: '1px solid #00000014', borderRadius: 999, padding: '5px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => roll(1)} title="roll down" disabled={idx >= total - 1}>↓</button>
+      </div>
+      <div
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowUp') { e.preventDefault(); roll(-1) }
+          else if (e.key === 'ArrowDown') { e.preventDefault(); roll(1) }
+          else if (e.key === 'Enter' && onSelect && idx < cards.length) { e.preventDefault(); onSelect(cards[idx]) }
+        }}
+        onWheel={onWheel}
+        onTouchStart={(e) => { touchY.current = e.touches[0].clientY }}
+        onTouchMove={(e) => {
+          if (touchY.current === null) return
+          const dy = e.touches[0].clientY - touchY.current
+          if (Math.abs(dy) > 32) { roll(dy < 0 ? 1 : -1); touchY.current = e.touches[0].clientY }
+        }}
+        onTouchEnd={() => { touchY.current = null }}
+        style={{ perspective: 1200, flex: 1, height: 360, position: 'relative', overflow: 'hidden', outline: 'none' }}
+      >
+        <div style={{ position: 'absolute', inset: 0, transformStyle: 'preserve-3d' }}>
+          {cards.map((key, i) => {
+            const off = i - idx
+            if (Math.abs(off) > 3) return null
+            const ang = off * SPREAD
+            return (
+              <div
+                key={key}
+                onClick={() => clickCard(i)}
+                style={{
+                  position: 'absolute', left: '4%', right: '4%', top: 65, height: 210,
+                  transform: `translateY(${Math.sin(ang) * R}px) translateZ(${(Math.cos(ang) - 1) * R + (off === 0 ? 40 : 0)}px) rotateX(${-ang}rad)`,
+                  opacity: Math.abs(off) > 2 ? 0.25 : 1 - Math.abs(off) * 0.22,
+                  zIndex: 100 - Math.abs(off),
+                  transition: 'transform 0.28s ease, opacity 0.28s ease',
+                  cursor: 'pointer',
+                }}
+              >
+                {renderCard(key, off, off === 0)}
+              </div>
+            )
+          })}
+          {(() => {
+            const off = cards.length - idx
+            if (Math.abs(off) > 3) return null
+            const ang = off * SPREAD
+            return (
+              <div
+                onClick={() => clickCard(cards.length)}
+                style={{
+                  position: 'absolute', left: '4%', right: '4%', top: 65, height: 210,
+                  transform: `translateY(${Math.sin(ang) * R}px) translateZ(${(Math.cos(ang) - 1) * R + (off === 0 ? 40 : 0)}px) rotateX(${-ang}rad)`,
+                  opacity: Math.abs(off) > 2 ? 0.25 : 1 - Math.abs(off) * 0.22,
+                  zIndex: 100 - Math.abs(off),
+                  transition: 'transform 0.28s ease, opacity 0.28s ease',
+                  cursor: 'pointer',
+                }}
+              >
+                {newCard}
+              </div>
+            )
+          })()}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null)
   const [id, setId] = useState('')
@@ -158,7 +285,14 @@ export default function App() {
   const [docs, setDocs] = useState<DocMeta[]>(() => loadDocs())
   const [activeId, setActiveId] = useState<string | null>(null)
   const [activePage, setActivePage] = useState<string | null>(null)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [activeFormat, setActiveFormat] = useState<FormatTab>('board')
+  void activeFormat
+  void setActiveFormat
+  void formatOf
+  void isLetterKind
+  void switchFormat
+  const [highlights, setHighlights] = useState<Highlight[]>([])
   // Overlay views: null = canvas, 'tools' = slim canvas panel,
   // 'topics' = topic cards, 'peers' = peer management.
   const [view, setView] = useState<null | 'tools' | 'topics' | 'peers'>(null)
@@ -285,12 +419,9 @@ export default function App() {
     activePageRef.current = pageId
     setActivePage(pageId)
     try { localStorage.setItem(`${LS_PAGE}.${docId}`, pageId) } catch {}
-    const pg = docsRef.current.find((d) => d.id === docId)?.pages.find((p) => p.id === pageId)
-    if (pg) {
-      const f = formatOf(pg)
-      activeFormatRef.current = f
-      setActiveFormat(f)
-    }
+    const f: FormatTab = 'board'
+    activeFormatRef.current = f
+    setActiveFormat(f)
   }
   const storedActivePage = (docId: string): string | null => {
     try { return localStorage.getItem(`${LS_PAGE}.${docId}`) } catch { return null }
@@ -325,6 +456,74 @@ export default function App() {
     else entry.hasAccess = prev.hasAccess
     const next = { ...peersRef.current, [from]: entry }
     setPeersBoth(next)
+  }
+
+  // ---- Highlights (dated board selections) ------------------------------
+  // A highlight pins a set of element ids on a board + auto-assigned date.
+  // Compiling a project map later = assembling highlights. Synced as a
+  // full-list LWW union (by id) over gossip; transport untouched.
+  const highlightsRef = useRef<Highlight[]>([])
+  const setHighlightsBoth = (docId: string, h: Highlight[]) => {
+    highlightsRef.current = h
+    setHighlights(h)
+    saveHighlights(docId, h)
+  }
+  const mergeHighlights = (roomId: string, remoteH: Highlight[]) => {
+    if (!Array.isArray(remoteH)) return
+    const map = new Map(highlightsRef.current.map((h) => [h.id, h]))
+    let changed = false
+    for (const rh of remoteH) {
+      if (!rh || typeof rh.id !== 'string') continue
+      const local = map.get(rh.id)
+      if (!local || (rh.createdAt ?? 0) >= (local.createdAt ?? 0)) {
+        map.set(rh.id, rh)
+        changed = true
+      }
+    }
+    if (changed) {
+      const next = [...map.values()].sort((a, b) => a.createdAt - b.createdAt)
+      if (roomId === activeRef.current) setHighlightsBoth(roomId, next)
+      else saveHighlights(roomId, next)
+    }
+  }
+  const broadcastHighlights = (roomId?: string) => {
+    const rid = roomId ?? activeRef.current
+    if (!rid) return
+    sendMsg({ t: 'highlights', highlights: highlightsRef.current })
+  }
+  const createHighlightFromSelection = () => {
+    const roomId = activeRef.current
+    const boardId = activePageRef.current ?? 'main'
+    const a = apiRef.current
+    if (!roomId || !a) return
+    let sel: any[] = []
+    try { sel = (a.getAppState() as any)?.selectedElementIds ? Object.keys((a.getAppState() as any).selectedElementIds).filter((k) => (a.getAppState() as any).selectedElementIds[k]) : [] } catch {}
+    if (!sel.length) {
+      // Fall back to all non-deleted elements currently visible.
+      sel = (a.getSceneElements() as any[]).filter((el) => !el.isDeleted).map((el) => el.id)
+    }
+    if (!sel.length) { setStatus('nothing to highlight — draw first, then select'); return }
+    const h: Highlight = { id: newHighlightId(), boardId, elementIds: sel, date: todayName(), createdAt: Date.now() }
+    setHighlightsBoth(roomId, [...highlightsRef.current, h])
+    broadcastHighlights(roomId)
+    setStatus(`highlighted ${sel.length} elements · ${h.date}`)
+  }
+  const deleteHighlight = (hid: string) => {
+    const roomId = activeRef.current
+    if (!roomId) return
+    setHighlightsBoth(roomId, highlightsRef.current.filter((h) => h.id !== hid))
+    broadcastHighlights(roomId)
+  }
+  const jumpToHighlight = (h: Highlight) => {
+    if (h.boardId !== (activePageRef.current ?? 'main')) switchPage(h.boardId)
+    window.setTimeout(() => {
+      try {
+        const a = apiRef.current
+        if (!a) return
+        const els = (a.getSceneElements() as any[]).filter((el) => h.elementIds.includes(el.id))
+        if (els.length) a.scrollToContent(els as any, { animate: true } as any)
+      } catch {}
+    }, 300)
   }
 
   const activeCh = () => (activeRef.current ? rooms.current.get(activeRef.current)?.ch ?? null : null)
@@ -781,7 +980,7 @@ export default function App() {
         return
       }
       // Ignore drawing traffic for background rooms (still track presence)
-      if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'f' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'pull' || m?.t === 'push' || m?.t === 'cursor' || m?.t === 'pages')) return
+      if (roomId !== activeRef.current && (m?.t === 'p' || m?.t === 'f' || m?.t === 'snap' || m?.t === 'snap-req' || m?.t === 'pull' || m?.t === 'push' || m?.t === 'cursor' || m?.t === 'pages' || m?.t === 'highlights')) return
       // Page tag (absent = legacy client on the default page).
       const msgPage = typeof m.page === 'string' ? m.page : 'main'
       const isActivePage = msgPage === (activePageRef.current ?? 'main')
@@ -793,6 +992,10 @@ export default function App() {
       }
       if (m?.t === 'pages') {
         mergePages(roomId, m.pages)
+        return
+      }
+      if (m?.t === 'highlights') {
+        mergeHighlights(roomId, m.highlights)
         return
       }
       if (m?.t === 'f') {
@@ -846,6 +1049,10 @@ export default function App() {
             if (JSON.stringify(f).length > MAX_MSG) continue
             sendMsg({ t: 'f', files: [f], page: pg })
           }
+        }
+        // Newcomers also need highlights for the project map future.
+        if (roomId === activeRef.current && highlightsRef.current.length) {
+          sendMsg({ t: 'highlights', highlights: highlightsRef.current })
         }
       } else if (m?.t === 'pull') {
         // Manual sync: only the owner answers, with full state for the
@@ -1080,12 +1287,10 @@ export default function App() {
     for (const rp of remotePages) {
       if (!rp || typeof rp.id !== 'string') continue
       const local = doc.pages.find((p) => p.id === rp.id)
-      const rkind: PageKind = rp.kind === 'letter' || rp.kind === 'daily' ? rp.kind : 'board'
       if (!local) {
         doc.pages.push({
           id: rp.id,
           name: typeof rp.name === 'string' ? rp.name : rp.id,
-          kind: rkind,
           createdAt: rp.createdAt ?? Date.now(),
           updatedAt: rp.updatedAt ?? Date.now(),
         })
@@ -1095,7 +1300,6 @@ export default function App() {
         if (roomId === activeRef.current && rp.id === activePageRef.current) sendMsg({ t: 'snap-req' })
       } else if ((rp.updatedAt ?? 0) > (local.updatedAt ?? 0)) {
         local.name = typeof rp.name === 'string' ? rp.name : local.name
-        local.kind = rkind
         local.updatedAt = rp.updatedAt
         changed = true
       }
@@ -1135,6 +1339,7 @@ export default function App() {
     const pages = doc?.pages?.length ? doc.pages : [mainPage()]
     const want = storedActivePage(roomId)
     const pg = pages.some((p) => p.id === want) ? want! : pages[0].id
+    setHighlightsBoth(roomId, loadHighlights(roomId))
     setActivePageBoth(roomId, pg)
     // load incoming snapshot (deferred until api ready if needed)
     applyStoredSnapshot(roomId, pg)
@@ -1189,34 +1394,8 @@ export default function App() {
     setStatus('connected — draw!')
   }
 
-  // Letter pages get a fixed US-Letter frame as the writing surface
-  // (visual boundary + export unit). Created once per page as an ordinary
-  // element, so it syncs to peers like anything else.
-  const ensureLetterSurface = (roomId: string, pageId: string) => {
-    const a = apiRef.current
-    if (!a) return
-    const doc = docsRef.current.find((d) => d.id === roomId)
-    const page = doc?.pages.find((p) => p.id === pageId)
-    if (!page || !isLetterKind(page.kind)) return
-    let raw: string | null = null
-    try { raw = localStorage.getItem(snapKey(roomId, pageId)) } catch {}
-    if (raw && raw !== '[]') return // page already has content
-    if (a.getSceneElements().length > 0) return
-    const frame = {
-      id: `frame-${pageId}`,
-      type: 'frame',
-      x: 0, y: 0, width: LETTER_W, height: LETTER_H,
-      angle: 0, strokeColor: '#1e1e1e', backgroundColor: 'transparent',
-      fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
-      roughness: 0, opacity: 100, strokeSharpness: 'sharp',
-      roundness: null, boundElements: [], link: null, locked: false,
-      name: page.name, index: 'a0', version: 1, versionNonce: Math.floor(Math.random() * 2 ** 31),
-      isDeleted: false, groupIds: [], frameId: null,
-    } as any
-    remote.current = true
-    try { US('frame', { elements: [...a.getSceneElements(), frame] }) } finally { remote.current = false }
-    try { a.scrollToContent([frame] as any, { animate: true } as any) } catch {}
-  }
+  // Letter surface deprecated with letter pages: boards need no frame.
+  const ensureLetterSurface = (_roomId: string, _pageId: string) => {}
 
   // Stable Excalidraw API callback (see note at apiRef): never restores
   // directly — restoring inside the mount effect races mount
@@ -1237,18 +1416,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const createPage = (kind: PageKind, name?: string) => {
+  const createPage = (name?: string) => {
     const roomId = activeRef.current
     if (!roomId) return
     const docs = [...docsRef.current]
     const doc = docs.find((d) => d.id === roomId)
     if (!doc) return
     const count = doc.pages.length + 1
-    const date = todayName()
     const pg: PageMeta = {
       id: newPageId(),
-      name: name ?? (kind === 'daily' ? (doc.pages.some((p) => p.name === date) ? `${date} · ${count}` : date) : kind === 'letter' ? `Letter ${count}` : `Board ${count}`),
-      kind,
+      name: name ?? `Board ${count}`,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     }
@@ -1258,25 +1435,8 @@ export default function App() {
     switchPage(pg.id)
   }
 
-  // Visiting the Daily tab lands on today's page, creating it if missing.
-  const switchFormat = (f: FormatTab) => {
-    const roomId = activeRef.current
-    if (!roomId) return
-    const doc = docsRef.current.find((d) => d.id === roomId)
-    if (!doc) return
-    activeFormatRef.current = f
-    setActiveFormat(f)
-    const inFormat = doc.pages.filter((p) => formatOf(p) === f)
-    if (inFormat.length) {
-      switchPage(inFormat[inFormat.length - 1].id)
-      return
-    }
-    if (f === 'daily') {
-      createPage('daily')
-    } else {
-      createPage(f === 'letters' ? 'letter' : 'board')
-    }
-  }
+  // Visiting a board = switching to it. (Daily auto-create deprecated.)
+  const switchFormat = (_f: FormatTab) => {}
 
   const ensureRoom = async (ticketStr: string, nickname: string, meta?: DocMeta): Promise<string> => {
     const node = nodeRef.current
@@ -1306,13 +1466,13 @@ export default function App() {
     return roomId
   }
 
-  // A doc is an overarching topic. It starts with one board page;
-  // letter and daily pages are added from the format tabs inside.
+  // A project is the highest unit. It starts with one board; more boards
+  // are added from the tools panel. Sharing links a peer to the project.
   const createDoc = async () => {
     const node = nodeRef.current
     if (!node) return
     if (activeRef.current) persistSnapshot(activeRef.current)
-    const name = prompt('Topic name', `Topic ${docsRef.current.length + 1}`)
+    const name = prompt('Project name', `Project ${docsRef.current.length + 1}`)
     if (name === null) return
     const ch = await node.create(nick.current)
     const roomId: string = ch.id()
@@ -1320,11 +1480,11 @@ export default function App() {
     rooms.current.set(roomId, { ch, owner, live: new Map() })
     pumpRoom(roomId, ch)
     const ticket = await ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
-    setDocsBoth([...docsRef.current, { id: roomId, owner, name: name.trim() || `Topic ${docsRef.current.length + 1}`, ticket, updatedAt: Date.now(), pages: [mainPage()] }])
+    setDocsBoth([...docsRef.current, { id: roomId, owner, name: name.trim() || `Project ${docsRef.current.length + 1}`, ticket, updatedAt: Date.now(), pages: [mainPage()] }])
     try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     switchDoc(roomId)
     await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
-    setStatus('new topic created — share link copied')
+    setStatus('new project created — share link copied')
   }
 
   const pushCollaborators = () => {
@@ -1733,16 +1893,24 @@ export default function App() {
   const myDocs = docs.filter((d) => d.owner === id)
   const sharedDocs = docs.filter((d) => d.owner !== id)
 
+  // Full zoom-out: opaque home screen, no whiteboard behind. Projects are
+  // a rolodex drum you roll through vertically.
   const overlayBack: React.CSSProperties = {
-    position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(18,20,28,.5)',
-    display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+    position: 'fixed', inset: 0, zIndex: 2000, background: '#eceef4',
+    display: 'flex', alignItems: 'stretch', justifyContent: 'center',
     fontFamily: 'system-ui',
   }
   const sheet: React.CSSProperties = {
-    background: '#fff', color: '#1a1d26', borderRadius: 20, padding: 20,
-    width: 'min(760px, 94vw)', maxHeight: '86vh', overflowY: 'auto',
-    boxShadow: '0 24px 80px #0008',
+    background: '#eceef4', color: '#1a1d26', padding: 24,
+    width: '100%', maxWidth: 1100, height: '100%', overflowY: 'auto',
   }
+  const deckCard: React.CSSProperties = {
+    height: '100%', boxSizing: 'border-box',
+    border: '1px solid #00000014', borderRadius: 20, padding: 18, cursor: 'pointer',
+    background: '#fff', boxShadow: '0 12px 40px #0002',
+    display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+  }
+  const deckCardActive: React.CSSProperties = { ...deckCard, border: '2px solid #1a1d26' }
   const cardGrid: React.CSSProperties = {
     display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 12,
   }
@@ -1773,41 +1941,53 @@ export default function App() {
   }
 
   const renderTopicCards = (list: DocMeta[]) => (
-    <div style={cardGrid}>
-      {list.map((d) => {
+    <RolodexDeck
+      cards={list.map((d) => d.id)}
+      onSelect={(key) => openDoc(key)}
+      renderCard={(key, _offset, front) => {
+        const d = list.find((x) => x.id === key)
+        if (!d) return null
         const access = peersOnDoc(d.id)
         const live = rooms.current.get(d.id)?.live.size ?? 0
-        const counts = (['board', 'letters', 'daily'] as FormatTab[]).map(
-          (f) => d.pages.filter((p) => formatOf(p) === f).length,
-        )
         return (
-          <div key={d.id} style={d.id === activeId ? cardActive : card} onClick={() => openDoc(d.id)}>
-            <div style={{ fontWeight: 700, marginBottom: 4 }}>{d.name}{d.owner === id ? ' ★' : ''}</div>
-            <div style={{ fontSize: 12, opacity: 0.65, marginBottom: 6 }}>
-              {counts[0]} board · {counts[1]} letters · {counts[2]} daily
-              {live > 0 && ` · ${live} live`}
+          <div
+            style={d.id === activeId ? deckCardActive : deckCard}
+            title={front ? 'Click to open' : 'Click to bring to front'}
+          >
+            <div>
+              <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 4 }}>{d.name}{d.owner === id ? ' ★' : ''}</div>
+              <div style={{ fontSize: 13, opacity: 0.65, marginBottom: 6 }}>
+                {d.pages.length} board{d.pages.length === 1 ? '' : 's'}
+                {live > 0 && ` · ${live} live`}
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                {d.owner === id ? 'owned by you' : `owner ${d.owner?.slice(0, 6) ?? '?'}`}
+                {access.length > 0 && (
+                  <span> · {access.slice(0, 4).map(([pid, p]) => dispNick(pid, p.nick)).join(', ')}{access.length > 4 ? ` +${access.length - 4}` : ''}</span>
+                )}
+              </div>
             </div>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>
-              {d.owner === id ? 'owned by you' : `owner ${d.owner?.slice(0, 6) ?? '?'}`}
-              {access.length > 0 && (
-                <span> · {access.slice(0, 4).map(([pid, p]) => dispNick(pid, p.nick)).join(', ')}{access.length > 4 ? ` +${access.length - 4}` : ''}</span>
-              )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button style={btn} onClick={(e) => { e.stopPropagation(); openDoc(d.id) }}>Open →</button>
             </div>
           </div>
         )
-      })}
-      <div style={{ ...card, borderStyle: 'dashed', display: 'flex', flexDirection: 'column', gap: 8, cursor: 'default' }}>
-        <button style={btn} onClick={createDoc}>+ new topic</button>
-        {!showAdd
-          ? <button style={btn} onClick={() => setShowAdd(true)}>⤵ join with ticket</button>
-          : (
-            <div>
-              <input placeholder="paste ticket…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
-              <button style={btn} onClick={joinTicket}>join</button>
-            </div>
-          )}
-      </div>
-    </div>
+      }}
+      newCard={
+        <div style={{ ...deckCard, borderStyle: 'dashed', cursor: 'default', justifyContent: 'flex-start' }}>
+          <button style={btn} onClick={createDoc}>+ new project</button>
+          {!showAdd
+            ? <button style={btn} onClick={() => setShowAdd(true)}>⤵ join with ticket</button>
+            : (
+              <div>
+                <input placeholder="paste ticket…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
+                <button style={btn} onClick={joinTicket}>join</button>
+              </div>
+            )}
+          <div style={{ fontSize: 12, opacity: 0.55, marginTop: 8 }}>roll ↑ ↓ to flip through projects</div>
+        </div>
+      }
+    />
   )
 
   const renderPeers = () => (
@@ -1855,7 +2035,30 @@ export default function App() {
         isCollaborating
         renderTopRightUI={stableTopRight}
       />
-      <button style={pill} onClick={() => setView('topics')} title={status}>
+      {/* Top-left project breadcrumb: the primary way to back out to projects. */}
+      <div
+        style={{
+          position: 'absolute', top: 12, left: 12, zIndex: 1000,
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'rgba(255,255,255,.94)', color: '#1a1d26',
+          padding: '6px 8px', borderRadius: 12,
+          boxShadow: '0 8px 32px #0003', backdropFilter: 'blur(8px)',
+          border: '1px solid #00000014', fontSize: 13, fontFamily: 'system-ui',
+          maxWidth: 'min(480px, 70vw)',
+        }}
+      >
+        <button
+          style={{ ...btn, margin: 0, fontWeight: 700 }}
+          onClick={() => setView('topics')}
+          title="Back out to projects"
+        >← Projects</button>
+        <span style={{ width: 8, height: 8, borderRadius: 999, background: connColor, display: 'inline-block', flexShrink: 0 }} />
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }}>
+          {activeDoc ? `${activeDoc.name}` : 'No project open'}
+          {activePage && activeDoc ? ` / ${activeDoc.pages.find((p) => p.id === activePage)?.name ?? ''}` : ''}
+        </span>
+      </div>
+      <button style={{ ...pill, cursor: 'default' }} title={status}>
         <span style={{ width: 10, height: 10, borderRadius: 999, background: connColor, display: 'inline-block' }} />
         ✦ live draw
         <span style={{ fontWeight: 400, opacity: 0.65, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -1872,32 +2075,37 @@ export default function App() {
         <div style={{ fontWeight: 700, marginBottom: 6 }}>✦ tools</div>
         {activeDoc && (
           <div style={{ marginBottom: 6 }}>
-            <div style={{ display: 'flex', gap: 4, marginBottom: 4 }}>
-              {(['board', 'letters', 'daily'] as FormatTab[]).map((f) => (
-                <button
-                  key={f}
-                  style={{ ...btn, background: activeFormat === f ? '#1a1d26' : '#eef0f6', color: activeFormat === f ? '#fff' : '#1a1d26' }}
-                  onClick={() => switchFormat(f)}
-                >
-                  {f === 'board' ? '◻ board' : f === 'letters' ? '▤ letters' : '📅 daily'}
-                </button>
-              ))}
-              <button
-                style={btn}
-                title={activeFormat === 'daily' ? 'new dated page' : activeFormat === 'letters' ? 'new letter' : 'new board page'}
-                onClick={() => createPage(activeFormat === 'letters' ? 'letter' : activeFormat === 'daily' ? 'daily' : 'board')}
-              >+</button>
-            </div>
-            {activeDoc.pages.filter((p) => formatOf(p) === activeFormat).length > 1 && (
+            <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 4 }}>Boards in this project</div>
+            <div style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center' }}>
               <select
                 value={activePage ?? ''}
                 onChange={(e) => switchPage(e.target.value)}
-                style={{ ...input, margin: 0 }}
+                style={{ ...input, margin: 0, flex: 1 }}
               >
-                {activeDoc.pages.filter((p) => formatOf(p) === activeFormat).map((p) => (
+                {activeDoc.pages.map((p) => (
                   <option key={p.id} value={p.id}>{p.name}</option>
                 ))}
               </select>
+              <button style={btn} title="new board" onClick={() => createPage()}>+</button>
+            </div>
+            <button style={{ ...btn, width: '100%' }} title="Highlight the current selection (auto-dated)" onClick={createHighlightFromSelection}>
+              ✦ highlight selection · auto-dates today
+            </button>
+            {highlights.length > 0 && (
+              <div style={{ marginTop: 6 }}>
+                <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 4 }}>Highlights ({highlights.length}) — future project map source</div>
+                {[...highlights].sort((a, b) => b.createdAt - a.createdAt).map((h) => {
+                  const bname = activeDoc.pages.find((p) => p.id === h.boardId)?.name ?? h.boardId.slice(0, 6)
+                  return (
+                    <div key={h.id} style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, padding: '3px 0' }}>
+                      <span style={{ background: '#fff34d', borderRadius: 4, padding: '0 6px', fontWeight: 700 }}>{h.date}</span>
+                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bname} · {h.elementIds.length} els</span>
+                      <button style={{ ...btn, padding: '1px 8px', fontSize: 11 }} onClick={() => jumpToHighlight(h)}>go</button>
+                      <button style={{ ...btn, padding: '1px 8px', fontSize: 11 }} onClick={() => deleteHighlight(h.id)}>✕</button>
+                    </div>
+                  )
+                })}
+              </div>
             )}
           </div>
         )}
@@ -1940,20 +2148,29 @@ export default function App() {
         )}
       </div>
       )}
-      {(view === 'topics' || view === 'peers') && (
-        <div style={overlayBack} onClick={() => setView(null)}>
+      {(view === 'topics' || view === 'peers' || !activeId) && (
+        <div style={overlayBack} onClick={() => { if (activeId) setView(null) }}>
           <div style={sheet} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
-              <button style={tabBtn(view === 'topics')} onClick={() => setView('topics')}>Topics</button>
-              <button style={tabBtn(view === 'peers')} onClick={() => setView('peers')}>Peers</button>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
+              <span style={{ fontWeight: 800, fontSize: 20 }}>✦ live draw</span>
+              <span style={{ width: 8, height: 8, borderRadius: 999, background: connColor, display: 'inline-block' }} />
               <span style={{ flex: 1 }} />
-              <button style={btn} onClick={() => setView(null)}>✕</button>
+              {activeId && view !== null && (
+                <button style={btn} onClick={() => setView(null)}>← Back to board</button>
+              )}
             </div>
-            {view === 'topics' && (
+            <div style={{ fontSize: 13, opacity: 0.6, marginBottom: 16 }}>
+              roll to flip through projects · click the front card to open it
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
+              <button style={tabBtn(view === 'topics' || !activeId)} onClick={() => setView('topics')}>Projects</button>
+              <button style={tabBtn(view === 'peers')} onClick={() => setView('peers')}>Peers</button>
+            </div>
+            {(view === 'topics' || !activeId) && (
               <div>
                 {myDocs.length > 0 && (
                   <div style={{ marginBottom: 16 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 8 }}>My topics</div>
+                    <div style={{ fontWeight: 700, marginBottom: 8 }}>My projects</div>
                     {renderTopicCards(myDocs)}
                   </div>
                 )}

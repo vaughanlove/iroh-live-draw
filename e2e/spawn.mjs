@@ -53,7 +53,7 @@ async function openTab(browser, name, url) {
     if (/draw_shared|draw_browser|endpoint|gossip|joining|firewall|presence|stage-vanish|mint-tomb|onchange#|\[flow\]|merge-drop/i.test(t)) log(name, 'CONSOLE:', t.slice(0, 400));
   });
   page.on('pageerror', (e) => log(name, 'PAGEERROR:', String(e).slice(0, 300)));
-  page.on('dialog', async (d) => { log(name, 'DIALOG:', d.message().slice(0, 80)); await d.accept('e2e-topic'); });
+  page.on('dialog', async (d) => { log(name, 'DIALOG:', d.message().slice(0, 80)); await d.accept('e2e-project'); });
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(2000);
   return page;
@@ -69,15 +69,16 @@ async function pillText(page) {
     return pill ? pill.textContent.trim().slice(0, 160) : '(no pill)';
   });
 }
-async function pillButton(page) {
+async function projectsButton(page) {
+  // Top-left breadcrumb opens the projects home (the status pill is display-only).
   return page.evaluate(() => {
     const btns = [...document.querySelectorAll('button')];
-    return btns.findIndex((b) => b.textContent?.includes('live draw') && b.textContent.length < 160);
+    return btns.findIndex((b) => b.textContent?.trim() === '← Projects');
   });
 }
 async function openPanel(page) {
-  // Pill opens the topics overlay; Peers tab holds the roster.
-  const idx = await pillButton(page);
+  // ← Projects opens the projects home; Peers tab holds the roster.
+  const idx = await projectsButton(page);
   if (idx >= 0) await page.evaluate((i) => [...document.querySelectorAll('button')][i].click(), idx);
   await sleep(500);
 }
@@ -95,7 +96,7 @@ async function panelText(page) {
   // Scope to the overlay sheet when open (body text is Excalidraw chrome).
   return page.evaluate(() => {
     const els = [...document.querySelectorAll('div')];
-    const sheet = els.find((d) => d.textContent?.includes('Shared with me') || d.textContent?.includes('No peers seen yet') || d.textContent?.includes('My topics'));
+    const sheet = els.find((d) => d.textContent?.includes('Shared with me') || d.textContent?.includes('No peers seen yet') || d.textContent?.includes('My projects'));
     if (sheet) return sheet.innerText.slice(0, 1500);
     const panel = els.find((d) => d.textContent?.includes('✦ tools'));
     return (panel ? panel.innerText : document.body.innerText).slice(0, 1500);
@@ -110,6 +111,13 @@ async function ls(page) {
     }
     return out;
   });
+}
+async function clickBtnByTitle(page, title) {
+  return page.evaluate((title) => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.title === title);
+    if (b) { b.click(); return true; }
+    return false;
+  }, title);
 }
 async function clickBtn(page, label) {
   const found = await page.evaluate((label) => {
@@ -129,7 +137,7 @@ async function scenarioLiveness() {
     await sleep(8000);
     log('owner', 'pill:', await pillText(A));
     await openPanel(A);
-    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    if (!(await clickBtn(A, '+ new project'))) throw new Error('no + new project button');
     await sleep(6000);
     const aLs = await ls(A);
     const docs = JSON.parse(aLs['draw.docs'] ?? '[]');
@@ -203,7 +211,7 @@ async function scenarioCrdt() {
     const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
     await sleep(8000);
     await openPanel(A);
-    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    if (!(await clickBtn(A, '+ new project'))) throw new Error('no + new project button');
     await sleep(6000);
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     if (!docs.length || !docs[0].ticket) throw new Error('no ticket');
@@ -256,15 +264,13 @@ async function scenarioCrdt() {
     log('crdt', 'concurrent converge:', conv, `A:[${sA.length}] B:[${sB.length}]`);
 
     // 5. overwrite-pull: guest diverges, pulls, gets written over by owner.
-    // Owner parks on another format first: the answer must come from the
-    // owner's stored board state, not silence.
+    // Owner parks on another board first: the answer must come from the
+    // owner's stored state for the guest's board, not the live scene.
     await A.evaluate(() => {
       [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '⋯').click();
     });
     await sleep(500);
-    await A.evaluate(() => {
-      [...document.querySelectorAll('button')].find((b) => b.textContent.includes('letters')).click();
-    });
+    if (!(await clickBtnByTitle(A, 'new board'))) throw new Error('no new-board button');
     await sleep(2000);
     const idD = await drawApi(B, 'addRect');
     await sleep(3000);
@@ -281,11 +287,11 @@ async function scenarioCrdt() {
     log('crdt', 'B lastPush:', await drawApi(B, 'lastPush'));
     await sleep(8000);
     const sB2 = (await sceneIds(B)).sort();
-    // Owner is parked on another format: B must equal the owner's STORED
-    // board state, not the owner's live (letters) scene.
+    // Owner is parked on another board: B must equal the owner's STORED
+    // state for the guest's board, not the owner's live scene.
     const ownerDocs = JSON.parse((await drawApi(A, 'lsGet', 'draw.docs')) ?? '[]');
     const odoc = ownerDocs.sort((a, b) => b.updatedAt - a.updatedAt)[0];
-    const boardPage = odoc.pages.find((p) => p.kind === 'board') ?? odoc.pages[0];
+    const boardPage = odoc.pages[0];
     const stored = JSON.parse((await drawApi(A, 'lsGet', `draw.snap.${odoc.id}.${boardPage.id}`)) ?? '[]').map((e) => e.id).sort();
     log('crdt', 'pull overwrote:', JSON.stringify(sB2) === JSON.stringify(stored), `owner-board:${JSON.stringify(stored)} B:${JSON.stringify(sB2)}`);
     // 6. keeper serves while owner is offline: close everything, fresh
@@ -319,7 +325,7 @@ async function scenarioKeeper() {
     const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
     await sleep(8000);
     await openPanel(A);
-    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    if (!(await clickBtn(A, '+ new project'))) throw new Error('no + new project button');
     await sleep(6000);
     const id1 = await drawApi(A, 'addRect');
     const id2 = await drawApi(A, 'addRect');
@@ -364,7 +370,7 @@ async function scenarioRejoin() {
     const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
     await sleep(8000);
     await openPanel(A);
-    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    if (!(await clickBtn(A, '+ new project'))) throw new Error('no + new project button');
     await sleep(6000);
     const idA = await drawApi(A, 'addRect');
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
@@ -424,7 +430,7 @@ async function scenarioLive() {
     const A = await openTab(browser, 'owner', `${APP_URL}/?debug=1`);
     await sleep(8000);
     await openPanel(A);
-    if (!(await clickBtn(A, '+ new topic'))) throw new Error('no + new topic button');
+    if (!(await clickBtn(A, '+ new project'))) throw new Error('no + new project button');
     await sleep(6000);
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     const ticket = docs[0].ticket;

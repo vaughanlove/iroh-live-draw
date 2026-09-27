@@ -115,6 +115,15 @@ impl DrawTicket {
     pub fn serialize(&self) -> String {
         <Self as Ticket>::encode_string(self) // above
     }
+
+    /// Bootstrap peers worth dialing: everyone in the ticket except
+    /// ourselves. Our own id accumulates in re-shared tickets (minting
+    /// includes self so others can dial us back), and self-dial failures
+    /// poison mesh state (observed as one-way broadcast stall after
+    /// rejoins) — so strip it at every dial site, not just some.
+    pub fn dial_peers(&self, me: &EndpointId) -> Vec<EndpointId> {
+        self.bootstrap.iter().cloned().filter(|id| id != me).collect()
+    }
 }
 
 impl Ticket for DrawTicket {
@@ -288,11 +297,10 @@ impl DrawNode {
         let secret_key = secret_key.unwrap_or_else(SecretKey::generate);
         let relay_map = match relay {
             Some(url) => iroh::RelayMap::from(bare_relay_url(&url)),
+            // No relay configured: our own relay. (Previously n0's public
+            // fleet; kept off it now that we run our own.)
             None => iroh::RelayMap::try_from_iter([
-                "https://use1-1.relay.n0.iroh.link",
-                "https://usw1-1.relay.n0.iroh.link",
-                "https://euc1-1.relay.n0.iroh.link",
-                "https://aps1-1.relay.n0.iroh.link",
+                "https://relay-production-61c3.up.railway.app",
             ])
             .expect("static relay list"),
         };
@@ -380,11 +388,8 @@ impl DrawNode {
     ) -> Result<(ChatSender, BoxStream<Result<Event>>)> {
         let topic_id = ticket.topic_id;
         let me = self.endpoint_id();
-        // Never dial ourselves: stored tickets accumulate our own id via
-        // re-sharing, and a self-dial failure poisons the topic's mesh
-        // state (observed as one-way broadcast stall after rejoins).
-        let bootstrap: Vec<EndpointId> =
-            ticket.bootstrap.iter().cloned().filter(|id| *id != me).collect();
+        // Invariant: never dial ourselves (see DrawTicket::dial_peers).
+        let bootstrap: Vec<EndpointId> = ticket.dial_peers(&me);
         // Seed relay hints before subscribing so bootstrap dials resolve
         // without discovery. Normalized undotted (see [`bare_relay_url`]).
         for (id, url) in &ticket.relays {

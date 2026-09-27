@@ -1,0 +1,54 @@
+# Dev environment + task runner (https://mise.jdx.dev).
+# `mise install` pins the toolchain; `mise run <task>` runs the workflows below.
+# Shell must have `eval "$(mise activate zsh)"` (~/.zshrc) for shims on PATH.
+
+[tools]
+node = "24"
+rust = "stable"
+
+# Local defaults mirror web/.env.development. Override per invocation,
+# e.g. RELAY_URL=https://relay-production-61c3.up.railway.app mise run keeper
+[env]
+KEEPER_DATA = "{{config_root}}/keeper-data"
+VITE_KEEPER_URL = "http://127.0.0.1:8081"
+
+[tasks.keeper]
+description = "Run the always-on watch peer locally (:8081)"
+run = "cargo run -p keeper"
+
+[tasks.web]
+description = "Run the Vite dev server (debug drawer on via .env.development)"
+dir = "web"
+run = "npm run dev"
+
+[tasks.serve]
+description = "Serve the production bundle (web/dist on :8080)"
+run = "cargo run --"
+
+[tasks.wasm]
+description = "Rebuild browser wasm bindings into web/src/pkg (see README §Build)"
+run = """
+cargo zigbuild --release --target wasm32-unknown-unknown -p draw-browser-wasm && \
+wasm-bindgen target/wasm32-unknown-unknown/release/draw_browser_wasm.wasm \
+  --out-dir web/src/pkg --target bundler
+"""
+
+[tasks.build]
+description = "Full production build: wasm bindings + frontend"
+depends = ["wasm"]
+dir = "web"
+run = "npm run build"
+
+# E2E: headless Chromium peers against a running app + keeper.
+#   mise run e2e                    # liveness scenario (default)
+#   mise run e2e --scenario keeper  # keeper-serves-while-owner-offline
+#   APP_URL=http://<lan-ip>:8080 RELAY_URL=<relay> mise run e2e --scenario rejoin
+[tasks.e2e]
+description = "Run a headless-browser scenario"
+dir = "e2e"
+usage = '''
+flag "--scenario <name>" default="liveness" {
+  choices "liveness" "crdt" "keeper" "rejoin" "live"
+}
+'''
+run = "node spawn.mjs {{ usage.scenario }}"
