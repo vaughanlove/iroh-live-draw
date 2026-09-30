@@ -1,8 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Excalidraw, reconcileElements, exportToSvg } from '@excalidraw/excalidraw'
-import type { ExcalidrawImperativeAPI, OrderedExcalidrawElement } from '@excalidraw/excalidraw/types'
 import { DrawNode } from './pkg/draw_browser_wasm.js'
-import '@excalidraw/excalidraw/index.css'
+import PenOverlay from './PenOverlay.js'
+import { Board } from './board.js'
+import { createBoardView, makeMeshProvider } from './boardView.js'
+import { erase_hit } from './pkg-pen/pen.js'
+import {
+  generateKey,
+  isEnvelope,
+  isFileEnvelope,
+  keyFromB64,
+  keyToB64,
+  loadKey,
+  openElement,
+  openFile,
+  saveKey,
+  sealElement,
+  sealFile,
+  selfTest,
+} from './crypto.js'
 
 async function copyText(t: string) {
   try {
@@ -20,6 +35,31 @@ async function copyText(t: string) {
 }
 
 type PeerCursor = { x: number; y: number; at: number }
+
+// ---- TOPS engineering-pad theme --------------------------------------
+// Pale green paper #D8E8D0, dark-green #7BAE7B grid at 20px intervals
+// (lines slightly translucent), monospace type, title-block header.
+const PAPER = '#d8e8d0'
+const GRID_LINE = 'rgba(123,174,123,0.4)'
+const INK = '#1e4620'
+const INK_SOFT = 'rgba(30,70,32,0.62)'
+const CARD_BG = '#eef4e4'
+const MONO =
+  "ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace"
+const paperGrid: React.CSSProperties = {
+  backgroundColor: PAPER,
+  backgroundImage:
+    `linear-gradient(${GRID_LINE} 1px, transparent 1px),` +
+    `linear-gradient(90deg, ${GRID_LINE} 1px, transparent 1px)`,
+  backgroundSize: '20px 20px',
+}
+// RolodexDeck lives outside App (stable identity preserves drum position),
+// so its button style lives at module scope too.
+const deckBtn: React.CSSProperties = {
+  background: CARD_BG, color: INK, border: `1.5px solid ${INK}`,
+  borderRadius: 4, padding: '5px 12px', cursor: 'pointer', fontSize: 13,
+  fontFamily: MONO,
+}
 // A project is the highest conceptual unit. Sharing links a peer to a
 // project (capabilities formalized in a future pass — basic logic only).
 // Inside a project live boards (freeform canvases) + highlights (dated
@@ -41,11 +81,20 @@ const LS_PAGE = 'draw.activepage'
 const LS_ALIASES = 'draw.aliases'
 const SS_TAB = 'draw.tab'
 
-// US Letter constants deprecated with letter pages (kept for reference).
+// US Letter width at 96dpi — boards are fixed-width engineering paper:
+// finite horizontally, infinite downward. (The old synced frame element
+// is gone; the "edge" is just where the clamp stops you.)
 const LETTER_W = 816
 const LETTER_H = 1056
-void LETTER_W
-void LETTER_H
+const SHEET_W = LETTER_W
+// Page-break interval down the infinite roll (scene units).
+const SHEET_H = LETTER_H
+// Grid unit drawn on the paper (scene units). Painted by us, under the
+// ink — Excalidraw's own grid rendering stays off (its zoom-dependent
+// step coarsening is what read "wrong").
+const GRID_UNIT = 10
+// Overscroll allowance so the sheet edge stays reachable.
+const SHEET_MARGIN = 80
 const highlightsKey = (doc: string) => `draw.highlights.${doc}`
 
 const newPageId = () => 'pg' + Math.random().toString(36).slice(2, 10)
@@ -204,8 +253,8 @@ function RolodexDeck({ cards, renderCard, newCard, onSelect }: {
   return (
     <div style={{ display: 'flex', gap: 12, alignItems: 'stretch' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, justifyContent: 'center' }}>
-        <button style={{ background: '#eef0f6', color: '#1a1d26', border: '1px solid #00000014', borderRadius: 999, padding: '5px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => roll(-1)} title="roll up" disabled={idx <= 0}>↑</button>
-        <button style={{ background: '#eef0f6', color: '#1a1d26', border: '1px solid #00000014', borderRadius: 999, padding: '5px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => roll(1)} title="roll down" disabled={idx >= total - 1}>↓</button>
+        <button style={deckBtn} onClick={() => roll(-1)} title="roll up" disabled={idx <= 0}>↑</button>
+        <button style={deckBtn} onClick={() => roll(1)} title="roll down" disabled={idx >= total - 1}>↓</button>
       </div>
       <div
         tabIndex={0}
@@ -273,7 +322,8 @@ function RolodexDeck({ cards, renderCard, newCard, onSelect }: {
 }
 
 export default function App() {
-  const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null)
+  const boardRef = useRef<Board | null>(null)
+  if (!boardRef.current) boardRef.current = new Board()
   const [id, setId] = useState('')
   const [peer, setPeer] = useState('')
   const [status, setStatus] = useState('starting…')
@@ -296,6 +346,14 @@ export default function App() {
   // Overlay views: null = canvas, 'tools' = slim canvas panel,
   // 'topics' = topic cards, 'peers' = peer management.
   const [view, setView] = useState<null | 'tools' | 'topics' | 'peers'>(null)
+  // Canvas tool: pen draws (PenOverlay), eraser deletes (hit-test),
+  // pan moves. No selection UI in v1.
+  const [tool, setTool] = useState<'pen' | 'eraser' | 'pan'>('pen')
+  const toolRef = useRef<'pen' | 'eraser' | 'pan'>('pen')
+  toolRef.current = tool
+  const spaceRef = useRef(false)
+  // Title-block header starts hidden; the ✦ stamp summons it.
+  const [showHeader, setShowHeader] = useState(false)
   const [aliases, setAliases] = useState<Record<string, string>>(() => {
     try { return JSON.parse(localStorage.getItem(LS_ALIASES) ?? '{}') } catch { return {} }
   })
@@ -317,7 +375,10 @@ export default function App() {
     s[dir][t] = (s[dir][t] ?? 0) + 1
     times.current.push(Date.now())
   }
-  const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
+  const apiRef = useRef<Board | null>(null)
+  // The board store is ready synchronously (no canvas-mount race like the
+  // old Excalidraw api): point apiRef at it on first render.
+  if (!apiRef.current) apiRef.current = boardRef.current
   const usLog = useRef<string[]>([])
   const US = (tag: string, scene: any) => {
     const a = apiRef.current
@@ -347,7 +408,6 @@ export default function App() {
   const epoch = useRef(Math.random().toString(36).slice(2))
   const lastSeq = useRef<Record<string, number>>({})
   const cursors = useRef<Record<string, PeerCursor>>({})
-  const lastPtr = useRef(0)
   const onlineRef = useRef<Record<string, string>>({})
   const peersRef = useRef<Record<string, PeerInfo>>(loadPeers())
   // docId -> { ch, owner, live:Set<peerId>, fwVersion }
@@ -526,6 +586,204 @@ export default function App() {
     }, 300)
   }
 
+  // ---- Fixed-width paper (infinite downward) --------------------------
+  // The viewport is clamped horizontally to the sheet (plus a small
+  // overscroll margin); vertically it runs free. Screen transform (per
+  // Excalidraw's renderer) is screen = (scene + scroll) * zoom, so the
+  // visible scene rect starts at (-scrollX, -scrollY).
+  // The grid is painted by us on the app container, UNDER the transparent
+  // canvas: exact color, exact GRID_UNIT spacing at every zoom, aligned to
+  // scene coords via background-position. Scroll-only writes never touch
+  // elements, so this can't disturb sync.
+  const paperRef = useRef<HTMLDivElement | null>(null)
+  const sheetPageRef = useRef<HTMLSpanElement | null>(null)
+  const lastSheetPage = useRef(1)
+  // Grid repaint is rAF-throttled: pointer moves fire far faster than
+  // frames, and every paint rebuilds 3 background strings + forces style
+  // recalc. Clamp math stays synchronous; only the DOM write coalesces.
+  const paintQueued = useRef(false)
+  const paintArgs = useRef<[number, number, number]>([0, 0, 1])
+  const paintPaperGrid = (scrollX: number, scrollY: number, zoom: number) => {
+    paintArgs.current = [scrollX, scrollY, zoom]
+    if (paintQueued.current) return
+    paintQueued.current = true
+    requestAnimationFrame(() => {
+      paintQueued.current = false
+      const [x, y, z] = paintArgs.current
+      paintPaperGridNow(x, y, z)
+    })
+  }
+  const paintPaperGridNow = (scrollX: number, scrollY: number, zoom: number) => {
+    const el = paperRef.current
+    if (!el) return
+    const step = GRID_UNIT * zoom
+    const pageH = SHEET_H * zoom
+    if (!isFinite(step) || step <= 0 || !isFinite(pageH) || pageH <= 0) return
+    const mod = (n: number, s: number) => ((n % s) + s) % s
+    el.style.backgroundColor = PAPER
+    // Page-break rules on top, grid beneath: one ruled sheet per SHEET_H.
+    el.style.backgroundImage =
+      `linear-gradient(${INK}99 2px, transparent 2px),` +
+      `linear-gradient(${GRID_LINE} 1px, transparent 1px),` +
+      `linear-gradient(90deg, ${GRID_LINE} 1px, transparent 1px)`
+    el.style.backgroundSize = `100% ${pageH}px, ${step}px ${step}px, ${step}px ${step}px`
+    el.style.backgroundPosition =
+      `0px ${mod(scrollY * zoom, pageH)}px,` +
+      `${mod(scrollX * zoom, step)}px ${mod(scrollY * zoom, step)}px,` +
+      `${mod(scrollX * zoom, step)}px ${mod(scrollY * zoom, step)}px`
+    // Live sheet indicator (imperative: no re-render on scroll).
+    const sheet = Math.max(1, Math.floor(-scrollY / SHEET_H) + 1)
+    if (sheet !== lastSheetPage.current) {
+      lastSheetPage.current = sheet
+      if (sheetPageRef.current) sheetPageRef.current.textContent = `SHEET-PG ${sheet}`
+    }
+  }
+  const clampViewport = (): boolean => {
+    const a = apiRef.current
+    if (!a) return false
+    let st: any
+    try { st = a.getAppState() } catch { return false }
+    const W = st.width ?? 0
+    const H = st.height ?? 0
+    if (!W || !H) return false
+    let zoom = typeof st.zoom?.value === 'number' ? st.zoom.value : 1
+    if (!isFinite(zoom) || zoom <= 0) return false
+    // Min zoom fits the sheet WIDTH (height runs infinite, so it plays no
+    // part). Max zoom stops runaway pinch. Below min there is no "beyond"
+    // to see or draw in.
+    const MAX_ZOOM = 8
+    const minZoom = W / (SHEET_W + 2 * SHEET_MARGIN)
+    let zoomOut = false
+    if (zoom < minZoom) { zoom = minZoom; zoomOut = true }
+    let zoomIn = false
+    if (zoom > MAX_ZOOM) { zoom = MAX_ZOOM; zoomIn = true }
+    const vw = W / zoom
+    if (!isFinite(vw)) return false
+    const lo = vw - SHEET_W - SHEET_MARGIN
+    const hi = SHEET_MARGIN
+    const nx = lo > hi ? (vw - SHEET_W) / 2 : Math.min(hi, Math.max(lo, st.scrollX ?? 0))
+    const ny = st.scrollY ?? 0 // vertical: free
+    paintPaperGrid(nx, ny, zoom)
+    if (!zoomOut && !zoomIn && Math.abs(nx - (st.scrollX ?? 0)) < 0.5) return false
+    try {
+      remote.current = true
+      a.updateScene({
+        appState: {
+          scrollX: nx,
+          ...((zoomOut || zoomIn) ? { zoom: { value: zoom } as any } : {}),
+        },
+      })
+    } catch {} finally {
+      remote.current = false
+    }
+    return true
+  }
+  const centerSheet = (fromTop = false) => {
+    const a = apiRef.current
+    if (!a) return
+    let st: any
+    try { st = a.getAppState() } catch { return }
+    const zoom = typeof st.zoom?.value === 'number' ? st.zoom.value : 1
+    const nx = ((st.width ?? 0) / zoom - SHEET_W) / 2
+    if (!isFinite(nx)) return
+    lastSheetPage.current = -1 // force the sheet indicator to repaint
+    try {
+      remote.current = true
+      a.updateScene({ appState: { scrollX: nx, ...(fromTop ? { scrollY: 0 } : {}) } })
+    } catch {} finally {
+      remote.current = false
+    }
+    paintPaperGrid(nx, fromTop ? 0 : (st.scrollY ?? 0), zoom)
+  }
+
+  // ---- Project data keys (peers only — never sent to the keeper) ----
+  // Share links carry `#t=<ticket>&k=<key>`; the ticket routes + auths,
+  // the key decrypts. Tickets (re)minted from the mesh never contain it.
+  const docKey = (docId: string): Uint8Array | null => loadKey(docId)
+  const shareLink = (ticket: string, docId: string): string => {
+    const k = loadKey(docId)
+    const frag = `t=${encodeURIComponent(ticket)}${k ? `&k=${encodeURIComponent(keyToB64(k))}` : ''}`
+    return `${location.origin}${location.pathname}#${frag}`
+  }
+  // Paste box accepts a bare ticket or a full share link.
+  const splitTicketInput = (input: string): { ticket: string; key: Uint8Array | null } => {
+    const t = input.trim()
+    const hi = t.indexOf('#')
+    const qs = hi >= 0 ? t.slice(hi + 1) : t.includes('&') || t.includes('=') ? t : ''
+    if (qs) {
+      try {
+        const ps = new URLSearchParams(qs)
+        const ticket = ps.get('t')
+        if (ticket) return { ticket, key: ps.get('k') ? keyFromB64(ps.get('k')!) : null }
+      } catch {}
+    }
+    return { ticket: t, key: null }
+  }
+
+  // ---- Wire crypto (envelopes) ----------------------------------------
+  // Outbound: plaintext scene → sealed envelopes (keyed project) or raw
+  // (legacy keyless project). Inbound: envelopes → plaintext; envelopes
+  // without a key are dropped (never throw into sync). Claims (meta) and
+  // tombstones ride cleartext in both directions — the keeper merges them
+  // without ever seeing content.
+  const openEls = async (roomId: string, elements: any[] | undefined): Promise<any[]> => {
+    if (!Array.isArray(elements)) return []
+    const key = docKey(roomId)
+    const out: any[] = []
+    for (const el of elements) {
+      if (isEnvelope(el)) {
+        if (!key) continue
+        const pt = await openElement(key, el)
+        if (pt) out.push(pt)
+      } else out.push(el)
+    }
+    return out
+  }
+  const openIncomingFiles = async (roomId: string, files: any[] | undefined): Promise<any[]> => {
+    if (!Array.isArray(files)) return []
+    const key = docKey(roomId)
+    const out: any[] = []
+    for (const f of files) {
+      if (isFileEnvelope(f)) {
+        if (!key) continue
+        const pt = await openFile(key, f)
+        if (pt) out.push(pt)
+      } else out.push(f)
+    }
+    return out
+  }
+  const sealEls = async (roomId: string, elements: any[]): Promise<any[]> => {
+    const key = docKey(roomId)
+    if (!key) return elements
+    const out: any[] = []
+    for (const el of elements) {
+      try {
+        const env = await sealElement(key, el)
+        if (env) out.push(env)
+      } catch (e) {
+        // Sealing must never fail silently again (insecure-origin Subtle
+        // once ate every outbound message with zero trace): loud + keep raw
+        // would leak; loud + drop preserves blindness. So: loud.
+        console.warn('[crypto] seal failed, dropping element:', e)
+        setStatus('encrypt failed — check console')
+      }
+    }
+    return out
+  }
+  const sealOutgoingFiles = async (roomId: string, files: any[]): Promise<any[]> => {
+    const key = docKey(roomId)
+    if (!key || !files.length) return files
+    const out: any[] = []
+    for (const f of files) {
+      try {
+        if (!f?.id) continue
+        const env = await sealFile(key, f.id, f)
+        if (env) out.push(env)
+      } catch {}
+    }
+    return out
+  }
+
   const activeCh = () => (activeRef.current ? rooms.current.get(activeRef.current)?.ch ?? null : null)
 
   // Self-heal against silent drops: union the live scene with the stored
@@ -596,10 +854,11 @@ export default function App() {
       if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
       const res = JSON.parse(json)
       lastFetch.current = `els=${res.elements?.length ?? '?'} tombs=${res.tombs?.length ?? '?'}`
-      if (Array.isArray(res.files)) ingestFiles(res.files)
-      const els = Array.isArray(res.elements) ? res.elements : []
+      const files = await openIncomingFiles(roomId, res.files)
+      if (files.length) ingestFiles(files)
+      const els = await openEls(roomId, Array.isArray(res.elements) ? res.elements : [])
       const tombs = Array.isArray(res.tombs) ? res.tombs : []
-      if (!els.length && !tombs.length) return
+      if (!els.length && !tombs.length) return false
       remote.current = true
       try {
         if (ingestTombs(tombs)) { /* enforced below */ }
@@ -779,7 +1038,7 @@ export default function App() {
         else { at.set(el.id, out.length); out.push({ ...el }) }
       }
       const before = (a.getSceneElements() as any[]).length
-      US('apply', { elements: out as OrderedExcalidrawElement[] })
+      US('apply', { elements: out as any[] })
       if (DEBUG && (a.getSceneElements() as any[]).length !== out.length) {
         console.log(`[apply-drop] want=${out.length} got=${(a.getSceneElements() as any[]).length}`)
       }
@@ -999,8 +1258,8 @@ export default function App() {
         return
       }
       if (m?.t === 'f') {
-        if (isActivePage) ingestFiles(m.files)
-        else mergePageSnapshot(roomId, msgPage, [], undefined, [], m.files ?? [])
+        if (isActivePage) void openIncomingFiles(roomId, m.files).then(ingestFiles)
+        else void (async () => mergePageSnapshot(roomId, msgPage, [], undefined, [], await openIncomingFiles(roomId, m.files)))()
         return
       }
       // CRDT ingest helper: tombstones first (they condemn), then elements.
@@ -1024,14 +1283,19 @@ export default function App() {
           if (m.seq <= (lastSeq.current[key] ?? -1)) { stats.current.stale++; return }
           lastSeq.current[key] = m.seq
         }
-        if (isActivePage) {
-          if (Array.isArray(m.files)) ingestFiles(m.files)
-          ingestCrdt(m.elements, m.meta, m.tombs ?? [])
-        } else if (Array.isArray(m.elements)) {
-          mergePageSnapshot(roomId, msgPage, m.elements, m.meta, m.tombs ?? [], m.files ?? [])
-        } else if (Array.isArray(m.tombs)) {
-          mergePageSnapshot(roomId, msgPage, [], undefined, m.tombs, m.files ?? [])
-        }
+        // Decrypt-then-ingest (fire-and-forget; merge-only, order-free).
+        void (async () => {
+          const els = await openEls(roomId, m.elements)
+          const files = await openIncomingFiles(roomId, m.files)
+          if (isActivePage && roomId === activeRef.current && msgPage === (activePageRef.current ?? 'main')) {
+            if (files.length) ingestFiles(files)
+            ingestCrdt(els, m.meta, m.tombs ?? [])
+          } else if (els.length || Array.isArray(m.tombs)) {
+            mergePageSnapshot(roomId, msgPage, els, m.meta, m.tombs ?? [], files)
+          } else if (files.length) {
+            mergePageSnapshot(roomId, msgPage, [], undefined, [], files)
+          }
+        })()
       } else if (m?.t === 'snap-req') {
         // Answer with elements + their binaries (forced: the requester is
         // usually a newcomer who missed the original file broadcasts).
@@ -1041,15 +1305,7 @@ export default function App() {
         // merges instead of replacing — no resurrection, no clobber.
         const pg = typeof m.page === 'string' ? m.page : (activePageRef.current ?? 'main')
         const { els, files, meta, tombs } = gatherPage(roomId, pg)
-        if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
-          sendMsg({ t: 'snap', elements: els, meta, tombs, files, page: pg })
-        } else {
-          sendMsg({ t: 'snap', elements: els, meta, tombs, page: pg })
-          for (const f of files) {
-            if (JSON.stringify(f).length > MAX_MSG) continue
-            sendMsg({ t: 'f', files: [f], page: pg })
-          }
-        }
+        void answerWith(roomId, pg, els, files, meta, tombs, 'snap')
         // Newcomers also need highlights for the project map future.
         if (roomId === activeRef.current && highlightsRef.current.length) {
           sendMsg({ t: 'highlights', highlights: highlightsRef.current })
@@ -1062,26 +1318,32 @@ export default function App() {
         if (!room || (room.owner && room.owner !== me.current)) return
         const pg = typeof m.page === 'string' ? m.page : (activePageRef.current ?? 'main')
         const { els, files, meta, tombs } = gatherPage(roomId, pg)
-        if (JSON.stringify(files).length + JSON.stringify(els).length < MAX_MSG) {
-          sendMsg({ t: 'push', elements: els, meta, tombs, files, page: pg })
-        } else {
-          sendMsg({ t: 'push', elements: els, meta, tombs, page: pg })
-          for (const f of files) {
-            if (JSON.stringify(f).length > MAX_MSG) continue
-            sendMsg({ t: 'f', files: [f], page: pg })
-          }
-        }
+        void answerWith(roomId, pg, els, files, meta, tombs, 'push')
       } else if (m?.t === 'push') {
         // Manual sync answer: only honored from the owner (or when no
         // owner is recorded). Our scene is REPLACED wholesale — local
         // unflushed edits are discarded, claims adopt the owner's.
+        // Envelopes decrypt first; a replace that can't decrypt aborts
+        // rather than wiping the canvas.
         const room = rooms.current.get(roomId)
         if (!room) { lastPush.current = 'ignored: no room'; return }
         if (room.owner && from !== room.owner) { lastPush.current = `ignored: not owner (from ${String(from).slice(0, 6)} owner ${(room.owner ?? '').slice(0, 6)})`; return }
         if (!isActivePage || !apiRef.current || !Array.isArray(m.elements)) { lastPush.current = 'ignored: wrong page/no api/bad elements'; return }
-        lastPush.current = `applied ${m.elements.length} els`
-        if (Array.isArray(m.files)) ingestFiles(m.files)
-        remote.current = true
+        void (async () => {
+          const els = await openEls(roomId, m.elements)
+          const files = await openIncomingFiles(roomId, m.files)
+          const hadEnvelopes = (m.elements as any[]).some(isEnvelope)
+          if (hadEnvelopes && els.length < (m.elements as any[]).length) {
+            lastPush.current = 'ignored: undecryptable push (missing key?)'
+            return
+          }
+          if (roomId !== activeRef.current || msgPage !== (activePageRef.current ?? 'main') || !apiRef.current) {
+            lastPush.current = 'ignored: switched away'
+            return
+          }
+          lastPush.current = `applied ${els.length} els`
+          if (files.length) ingestFiles(files)
+          remote.current = true
         try {
           metaActive.current = new Map()
           tombsActive.current = new Map()
@@ -1090,11 +1352,11 @@ export default function App() {
           }
           // Claims adopt the owner's; element versions seed from the pushed
           // scene so future merges compare against real versions.
-          for (const el of m.elements as any[]) {
+          for (const el of els as any[]) {
             const c = (m.meta as any)?.[el.id]
             metaActive.current.set(el.id, { v: el.version ?? 0, ts: c?.[0] ?? 0, author: c?.[1] ?? '' })
           }
-          US('push', { elements: m.elements as OrderedExcalidrawElement[], commitToHistory: false })
+          US('push', { elements: els as any[], commitToHistory: false })
           for (const el of apiRef.current.getSceneElements()) sentVersions.current[el.id] = el.version
           knownIds.current = new Set((apiRef.current.getSceneElements() as any[]).map((el: any) => el.id))
           enforceTombs()
@@ -1107,17 +1369,45 @@ export default function App() {
         }
         persistSnapshot(roomId, msgPage)
         setStatus('synced from owner')
+        })()
       } else if (m?.t === 'snap') {
-        if (isActivePage) {
-          if (Array.isArray(m.files)) ingestFiles(m.files)
-          ingestCrdt(m.elements, m.meta, m.tombs ?? [])
-        } else if (Array.isArray(m.elements)) {
-          mergePageSnapshot(roomId, msgPage, m.elements, m.meta, m.tombs ?? [], m.files ?? [])
-        } else if (Array.isArray(m.tombs)) {
-          mergePageSnapshot(roomId, msgPage, [], undefined, m.tombs, m.files ?? [])
-        }
+        // Decrypt-then-ingest, like 'p' above.
+        void (async () => {
+          const els = await openEls(roomId, m.elements)
+          const files = await openIncomingFiles(roomId, m.files)
+          if (isActivePage && roomId === activeRef.current && msgPage === (activePageRef.current ?? 'main')) {
+            if (files.length) ingestFiles(files)
+            ingestCrdt(els, m.meta, m.tombs ?? [])
+          } else if (els.length || Array.isArray(m.tombs)) {
+            mergePageSnapshot(roomId, msgPage, els, m.meta, m.tombs ?? [], files)
+          } else if (files.length) {
+            mergePageSnapshot(roomId, msgPage, [], undefined, [], files)
+          }
+        })()
       }
     }
+  }
+
+  // Answer a snapshot/pull request: seal the gathered state (when keyed)
+  // and send, splitting binaries out when oversize. `kind` is snap|push.
+  const answerWith = async (
+    roomId: string, pg: string,
+    els: any[], files: any[], meta: Record<string, [number, string]>, tombs: any[],
+    kind: 'snap' | 'push',
+  ) => {
+    try {
+      const sels = await sealEls(roomId, els)
+      const sfiles = await sealOutgoingFiles(roomId, files)
+      if (JSON.stringify(sfiles).length + JSON.stringify(sels).length < MAX_MSG) {
+        sendMsg({ t: kind, elements: sels, meta, tombs, files: sfiles, page: pg })
+      } else {
+        sendMsg({ t: kind, elements: sels, meta, tombs, page: pg })
+        for (const f of sfiles) {
+          if (JSON.stringify(f).length > MAX_MSG) continue
+          sendMsg({ t: 'f', files: [f], page: pg })
+        }
+      }
+    } catch {}
   }
 
   // Gather a page's full state for snapshot/pull answers: the live scene
@@ -1343,6 +1633,8 @@ export default function App() {
     setActivePageBoth(roomId, pg)
     // load incoming snapshot (deferred until api ready if needed)
     applyStoredSnapshot(roomId, pg)
+    centerSheet(!localStorage.getItem(snapKey(roomId, pg)))
+    ensureLetterSurface(roomId, pg)
     ensureLetterSurface(roomId, pg)
     epoch.current = Math.random().toString(36).slice(2)
     seq.current = 0
@@ -1385,6 +1677,7 @@ export default function App() {
     restorePending.current = null
     setActivePageBoth(roomId, pageId)
     applyStoredSnapshot(roomId, pageId)
+    centerSheet(!localStorage.getItem(snapKey(roomId, pageId)))
     ensureLetterSurface(roomId, pageId)
     for (const [, r] of rooms.current) {
       try { r.ch.sender.set_current_doc?.(presenceDoc()) } catch {}
@@ -1397,24 +1690,11 @@ export default function App() {
   // Letter surface deprecated with letter pages: boards need no frame.
   const ensureLetterSurface = (_roomId: string, _pageId: string) => {}
 
-  // Stable Excalidraw API callback (see note at apiRef): never restores
-  // directly — restoring inside the mount effect races mount
-  // initialization and the update gets silently swallowed (commits keep
-  // delivering the empty scene). Instead, arm a pending restore that the
-  // first post-mount onChange consumes, i.e. strictly after mount committed.
+  // No mount race anymore: the board store is synchronous, so restores
+  // run directly in switchDoc/switchPage. Kept as stubs for the debug hooks.
   const apiCalls = useRef<string[]>([])
   const restorePending = useRef<{ room: string; page: string } | null>(null)
-  const onApi = useCallback((a: ExcalidrawImperativeAPI | null) => {
-    const first = apiRef.current !== a
-    apiCalls.current.push(`${Date.now() % 100000}:${first ? 'first' : 'repeat'}`)
-    if (apiCalls.current.length > 12) apiCalls.current.shift()
-    setApi(a)
-    apiRef.current = a
-    if (first && a && activeRef.current) {
-      restorePending.current = { room: activeRef.current, page: activePageRef.current ?? 'main' }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  void restorePending
 
   const createPage = (name?: string) => {
     const roomId = activeRef.current
@@ -1479,11 +1759,18 @@ export default function App() {
     const owner: string = me.current
     rooms.current.set(roomId, { ch, owner, live: new Map() })
     pumpRoom(roomId, ch)
+    // Wait for the home relay before minting: tickets without relay hints
+    // are undialable, and the keeper (which joins from the stored ticket)
+    // would sit in the topic alone, merging nothing. Same wait as share().
+    setStatus('waiting for relay…')
+    await awaitRelay()
     const ticket = await ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
     setDocsBoth([...docsRef.current, { id: roomId, owner, name: name.trim() || `Project ${docsRef.current.length + 1}`, ticket, updatedAt: Date.now(), pages: [mainPage()] }])
     try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
     switchDoc(roomId)
-    await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
+    // Fresh data key, stored locally, shared only via the link fragment.
+    saveKey(roomId, generateKey())
+    await copyText(shareLink(ticket, roomId))
     setStatus('new project created — share link copied')
   }
 
@@ -1504,6 +1791,9 @@ export default function App() {
   // boot: stable identity, then room from share link if present
   useEffect(() => {
     let dead = false
+    void selfTest().then((ok) => {
+      if (!ok && !dead) setStatus('encryption self-test FAILED — see console')
+    })
     ;(async () => {
       try {
         const DN: any = DrawNode
@@ -1522,6 +1812,10 @@ export default function App() {
           setStatus('joining…')
           const roomId = await ensureRoom(ticket, nick.current)
           if (dead) return
+          // Data key rides the fragment, never the ticket: store it.
+          const k = new URLSearchParams(location.hash.slice(1)).get('k')
+          const raw = k ? keyFromB64(k) : null
+          if (raw) saveKey(roomId, raw)
           switchDoc(roomId)
           sendMsg({ t: 'snap-req' })
           // Clear the ticket hash so refresh doesn't rejoin, but preserve
@@ -1548,8 +1842,29 @@ export default function App() {
   }, [])
 
   // persist canvas debounced per active doc
+  const gpuWarned = useRef(false)
   useEffect(() => {
-    const t = window.setInterval(() => { if (activeRef.current) persistSnapshot(activeRef.current) }, 3000)
+    const t = window.setInterval(() => {
+      if (activeRef.current) persistSnapshot(activeRef.current)
+      // Surface GPU death visibly (once): silent frame-loop failure looks
+      // exactly like "commits vanish, grid stays".
+      // stats shape: "begun dropped drawn last_error | ferr=N msg".
+      if (!gpuWarned.current && viewRef.current) {
+        try {
+          const s = viewRef.current.stats()
+          const begun = parseInt(s.split(' ')[0] ?? 'NaN', 10)
+          const sceneLen = apiRef.current?.getSceneElements?.().length ?? 0
+          if (/ferr=(?!0(\s|$))/.test(s) || (/acquire:/.test(s) && begun === 0)) {
+            gpuWarned.current = true
+            setStatus(`canvas trouble: ${s.slice(0, 120)}`)
+          } else if (Number.isFinite(begun) && begun === 0 && sceneLen > 0) {
+            // Frames never presented while ink exists: surface dead.
+            gpuWarned.current = true
+            setStatus(`canvas trouble: gpu never presented (${s.slice(0, 100)})`)
+          }
+        } catch {}
+      }
+    }, 3000)
     return () => clearInterval(t)
   }, [])
 
@@ -1557,7 +1872,7 @@ export default function App() {
   useEffect(() => {
     if (!DEBUG) return
     ;(window as any).__draw = {
-      scene: () => (apiRef.current?.getSceneElements() ?? []).map((el: any) => ({ id: el.id, type: el.type, v: el.version, del: !!el.isDeleted })),
+      scene: () => (apiRef.current?.getSceneElements() ?? []).map((el: any) => ({ id: el.id, type: el.type, v: el.version, del: !!el.isDeleted, w: el.strokeWidth, n: el.points?.length })),
       sceneAll: () => {
         const a: any = apiRef.current
         const els = a?.getSceneElementsIncludingDeleted ? a.getSceneElementsIncludingDeleted() : (a?.getSceneElements() ?? [])
@@ -1579,31 +1894,54 @@ export default function App() {
         if (!a) return
         a.updateScene({ elements: (a.getSceneElements() as any[]).filter((el) => el.id !== id) })
       },
-      reconcileTest: (els: any[]) => {
+      // Stroke-width probe: rewrite all live widths (render-only, versions
+      // untouched so nothing broadcasts).
+      setWidths: (w: number) => {
         const a = apiRef.current
         if (!a) return null
-        const local = a.getSceneElements() as any[]
-        const out = reconcileElements(local, els as any, a.getAppState()) as any[]
-        return {
-          local: local.map((e) => ({ id: e.id, v: e.version, idx: e.index })),
-          remote: els.map((e) => ({ id: e.id, v: e.version, idx: e.index })),
-          out: out.map((e) => ({ id: e.id, v: e.version, idx: e.index, del: !!e.isDeleted })),
+        remote.current = true
+        try {
+          US('thin-test', {
+            elements: (a.getSceneElements() as any[]).map((el) => ({ ...el, strokeWidth: w })),
+          })
+        } finally {
+          remote.current = false
         }
+        return true
       },
+      reconcileTest: (_els: any[]) => null, // retired with Excalidraw
       collabPing: () => {
         cursors.current['probe'] = { x: 1, y: 1, at: Date.now() }
         pushCollaborators()
       },
       meta: () => [...metaActive.current.entries()].map(([id, e]) => ({ id, ...e })),
+      mesh: () => {
+        const els = apiRef.current?.getSceneElements() ?? []
+        return (els as any[]).map((el) => {
+          try {
+            const m = meshProviderRef.current(el)
+            return m ? { id: el.id, verts: m.verts.length, idx: m.idx.length } : { id: el.id, skipped: true }
+          } catch (e) { return { id: el?.id, err: String(e).slice(0, 120) } }
+        })
+      },
       tombs: () => [...tombsActive.current.entries()].map(([id, e]) => ({ id, ...e })),
       stats: () => JSON.parse(JSON.stringify(stats.current)),
       lastPush: () => lastPush.current,
+      gpu: () => {
+        try { return viewRef.current?.stats() ?? 'no-view' } catch (e) { return `err ${String(e).slice(0, 80)}` }
+      },
       fetchErr: () => fetchErr.current,
       lastFetch: () => lastFetch.current,
       flushCount: () => flushCount.current,
       apiCalls: () => apiCalls.current,
       usLog: () => usLog.current,
       counts: () => ({ vanish: vanishCount.current, persist: persistCount.current, flush: flushCount.current, changes: changeCount.current, lastSeen: lastSeenCount.current, seenHist: seenHist.current }),
+      scroll: () => {
+        try {
+          const s: any = apiRef.current?.getAppState()
+          return s ? { x: s.scrollX, y: s.scrollY, z: s.zoom?.value ?? 1, w: s.width, h: s.height } : null
+        } catch { return null }
+      },
       diag: () => ({
         meta: metaActive.current.size,
         tombs: tombsActive.current.size,
@@ -1612,6 +1950,7 @@ export default function App() {
         scene: (apiRef.current?.getSceneElements() ?? []).length,
       }),
       lsGet: (k: string) => { try { return localStorage.getItem(k) } catch { return null } },
+      lsDel: (k: string) => { try { localStorage.removeItem(k); return true } catch { return false } },
     }
     return () => { try { delete (window as any).__draw } catch {} }
   }, [])
@@ -1619,6 +1958,13 @@ export default function App() {
   // flush outbound drawing batches ~16/s
   useEffect(() => {
     const t = window.setInterval(flushDirty, 60)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Sheet clamp backstop (covers pans that don't fire onChange).
+  useEffect(() => {
+    const t = window.setInterval(clampViewport, 150)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -1699,9 +2045,15 @@ export default function App() {
       for (const f of files) if (f?.id) sentFiles.current.add(f.id)
     } catch {}
   }
-  const flushDirty = () => {
+  const flushDirty = async () => {
     if (!dirtyRef.current.size && !dirtyFilesRef.current.size && !dirtyTombs.current.size) return
     if (!me.current || !activeCh()) return
+    // Capture room+page: sealing is async, and a switch mid-seal must not
+    // send this room's ink on another room's channel (persist-on-switch
+    // already saved it; dropping here loses nothing).
+    const roomId = activeRef.current
+    const pg = activePageRef.current ?? 'main'
+    if (!roomId) return
     const els = [...dirtyRef.current.values()]
     dirtyRef.current.clear()
     const files = [...dirtyFilesRef.current.values()]
@@ -1718,55 +2070,47 @@ export default function App() {
       const m = metaActive.current.get(el.id)
       if (m) meta[el.id] = [m.ts, m.author]
     }
-    if (!files.length && !tombs.length) {
-      if (els.length) sendMsg({ t: 'p', elements: els, meta })
+    const sels = await sealEls(roomId, els)
+    const sfiles = await sealOutgoingFiles(roomId, files)
+    if (roomId !== activeRef.current) return // switched mid-seal: drop
+    if (!sfiles.length && !tombs.length) {
+      if (sels.length) sendMsg({ t: 'p', elements: sels, meta, page: pg })
       return
     }
-    const body = { t: 'p', elements: els, meta, tombs }
-    if (!files.length) {
+    const body = { t: 'p', elements: sels, meta, tombs, page: pg }
+    if (!sfiles.length) {
       sendMsg(body)
       return
     }
-    const inline = JSON.stringify(files).length + JSON.stringify(body).length < MAX_MSG
+    const inline = JSON.stringify(sfiles).length + JSON.stringify(body).length < MAX_MSG
     if (inline) {
-      sendMsg({ ...body, files })
+      sendMsg({ ...body, files: sfiles })
     } else {
-      if (els.length || tombs.length) sendMsg(body)
-      for (const f of files) {
+      if (sels.length || tombs.length) sendMsg(body)
+      for (const f of sfiles) {
         if (JSON.stringify(f).length > MAX_MSG) {
           setStatus('image too large to sync (>180KB)')
           continue
         }
-        sendMsg({ t: 'f', files: [f] })
+        sendMsg({ t: 'f', files: [f], page: pg })
       }
     }
   }
 
-  const onChange = (elements: readonly OrderedExcalidrawElement[], _appState: any, files: Record<string, any>) => {
+  const onChange = (elements: readonly any[], _appState: any, files: Record<string, any>) => {
+    clampViewport()
     changeCount.current += 1
     lastSeenCount.current = (elements as any[]).length
     seenHist.current.push((elements as any[]).length)
     if (seenHist.current.length > 12) seenHist.current.shift()
     if (changeCount.current <= 6 && DEBUG) console.log(`[onchange#${changeCount.current}] t=${Date.now() % 100000} seen=${(elements as any[]).length} remote=${remote.current}`)
-    // Consume a pending post-mount restore first: this onChange proves the
-    // mount committed, so restoring now is safe. Return right after — the
-    // restore's own updateScene fires a fresh onChange for normal handling.
-    if (restorePending.current && !remote.current && apiRef.current) {
-      const { room, page } = restorePending.current
-      restorePending.current = null
-      // Only honor it if we're still on that doc+page (a switch in between
-      // restores directly and supersedes this).
-      if (room === activeRef.current && page === (activePageRef.current ?? 'main')) {
-        applyStoredSnapshot(room, page)
-        ensureLetterSurface(room, page)
-      }
-      return
-    }
     if (remote.current || !me.current || !activeCh()) return
     lastEditAt.current = Date.now()
     const now = Date.now()
     let touched = false
     const seen = new Set<string>()
+    // NOTE: no width rewriting here. The pen overlay commits final widths
+    // directly (fractional allowed); Excalidraw shapes keep native 1/2/3.
     for (const el of elements as any[]) {
       seen.add(el.id)
       if (sentVersions.current[el.id] === el.version) continue
@@ -1791,32 +2135,205 @@ export default function App() {
     if (touched && dirtyRef.current.size > 200) flushDirty() // backpressure: huge burst flushes early
   }
 
-  const onPointerUpdate = (payload: { pointer: { x: number; y: number } }) => {
-    const now = Date.now()
-    if (now - lastPtr.current < 80 || !me.current || !activeCh()) return
-    lastPtr.current = now
-    sendMsg({ t: 'cursor', x: payload.pointer.x, y: payload.pointer.y })
-  }
-
-  // Stable prop identities: inline closures get fresh identities every App
-  // render (presence roster ticks, debug stats, status), and Excalidraw
-  // re-subscribes its scene listener on each change — replaying stale,
-  // empty scene readings that our delete detection then treats as real.
-  // The ref always forwards to the latest logic; only the identity is fixed.
+  // Stable onChange identity for the board store fan-out.
   const onChangeRef = useRef(onChange)
   onChangeRef.current = onChange
   const stableOnChange = useCallback(
-    (elements: readonly OrderedExcalidrawElement[], appState: any, files: Record<string, any>) =>
+    (elements: readonly any[], appState: any, files: Record<string, any>) =>
       onChangeRef.current(elements, appState, files),
     [],
   )
-  const onPointerUpdateRef = useRef(onPointerUpdate)
-  onPointerUpdateRef.current = onPointerUpdate
-  const stableOnPointerUpdate = useCallback(
-    (payload: { pointer: { x: number; y: number } }) => onPointerUpdateRef.current(payload),
-    [],
-  )
-  const stableTopRight = useCallback(() => null, [])
+
+  // ---- Canvas input: pan + eraser (pen lives in PenOverlay) ------------
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const meshProviderRef = useRef(makeMeshProvider())
+  const panRef = useRef<{ x: number; y: number; btn: number } | null>(null)
+
+  const sceneOf = (clientX: number, clientY: number) => {
+    const canvas = canvasRef.current
+    const board = boardRef.current
+    if (!canvas || !board) return null
+    const r = canvas.getBoundingClientRect()
+    const c = board.camera
+    return {
+      x: (clientX - r.left) / c.zoom - c.scrollX,
+      y: (clientY - r.top) / c.zoom - c.scrollY,
+    }
+  }
+
+  const eraseAt = (clientX: number, clientY: number) => {
+    const board = boardRef.current
+    if (!board) return
+    const s = sceneOf(clientX, clientY)
+    if (!s) return
+    const radius = 12 / board.camera.zoom
+    const targets = board.elements
+      .filter((el: any) => el?.type === 'freedraw' && !el.isDeleted && Array.isArray(el.points))
+      .map((el: any) => ({
+        id: el.id,
+        points: (el.points as [number, number][]).map(([px, py]) => [px + (el.x ?? 0), py + (el.y ?? 0)]),
+        width: +el.strokeWidth || 1,
+      }))
+    if (!targets.length) return
+    let hits: string[] = []
+    try {
+      hits = JSON.parse(erase_hit(JSON.stringify(targets), s.x, s.y, radius))
+    } catch { return }
+    if (!hits.length) return
+    const dead = new Set(hits)
+    // Removal mint-tombs via the usual scan: ids were known, now missing.
+    apiRef.current?.updateScene({ elements: board.elements.filter((el: any) => !dead.has(el.id)) })
+  }
+
+  const onCanvasPointerDown = (e: React.PointerEvent) => {
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    if (pointersRef.current.size === 2) {
+      // Second finger lands: pinch takes over, whatever was happening ends.
+      panRef.current = null
+      pinchRef.current = pinchState()
+      return
+    }
+    const panning = toolRef.current === 'pan' || spaceRef.current || e.button === 1
+    if (panning) {
+      panRef.current = { x: e.clientX, y: e.clientY, btn: e.button }
+      ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
+      return
+    }
+    if (toolRef.current === 'eraser') {
+      ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
+      panRef.current = { x: e.clientX, y: e.clientY, btn: -2 } // erase stroke
+      eraseAt(e.clientX, e.clientY)
+    }
+  }
+
+  const onCanvasPointerMove = (e: React.PointerEvent) => {
+    if (pointersRef.current.has(e.pointerId)) {
+      pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    }
+    const pinch = pinchRef.current
+    const board = boardRef.current
+    if (pinch && pointersRef.current.size >= 2 && board) {
+      // Two fingers: zoom around the midpoint + pan with it.
+      const cur = pinchState()
+      if (cur && pinch.dist > 0 && cur.dist > 0) {
+        const c = board.camera
+        const factor = cur.dist / pinch.dist
+        const zx = Math.min(8, Math.max(0.1, c.zoom * factor))
+        // Scene point under the old midpoint stays under the new one.
+        const r = canvasRef.current?.getBoundingClientRect()
+        const mx = (cur.midX - (r?.left ?? 0))
+        const my = (cur.midY - (r?.top ?? 0))
+        const sx = mx / c.zoom - c.scrollX
+        const sy = my / c.zoom - c.scrollY
+        c.zoom = zx
+        c.scrollX = mx / zx - sx + (cur.midX - pinch.midX) / zx
+        c.scrollY = my / zx - sy + (cur.midY - pinch.midY) / zx
+        pinchRef.current = cur
+        clampViewport()
+      }
+      return
+    }
+    const pan = panRef.current
+    if (!pan || !e.buttons) return
+    if (!board) return
+    if (pan.btn === -2) {
+      eraseAt(e.clientX, e.clientY)
+      return
+    }
+    const dx = (e.clientX - pan.x) / board.camera.zoom
+    const dy = (e.clientY - pan.y) / board.camera.zoom
+    pan.x = e.clientX
+    pan.y = e.clientY
+    board.camera.scrollX += dx
+    board.camera.scrollY += dy
+    clampViewport()
+  }
+
+  const onCanvasPointerUp = (e: React.PointerEvent) => {
+    pointersRef.current.delete(e.pointerId)
+    if (pointersRef.current.size < 2) pinchRef.current = null
+    if (pointersRef.current.size === 0) panRef.current = null
+  }
+
+  const onCanvasWheel = (e: React.WheelEvent) => {
+    const board = boardRef.current
+    const canvas = canvasRef.current
+    if (!board || !canvas) return
+    const r = canvas.getBoundingClientRect()
+    const mx = e.clientX - r.left
+    const my = e.clientY - r.top
+    if (e.ctrlKey || e.metaKey) {
+      // Pinch/keyboard zoom around the cursor.
+      const factor = Math.exp(-e.deltaY * 0.01)
+      const c = board.camera
+      const zx = Math.min(8, Math.max(0.1, c.zoom * factor))
+      const sx = (mx / c.zoom - c.scrollX) // scene under cursor, before
+      const sy = (my / c.zoom - c.scrollY)
+      c.zoom = zx
+      c.scrollX = mx / zx - sx
+      c.scrollY = my / zx - sy
+    } else {
+      // The roll scrolls: wheel runs down the sheet.
+      board.camera.scrollY -= e.deltaY / board.camera.zoom
+      board.camera.scrollX -= e.deltaX / board.camera.zoom
+    }
+    clampViewport()
+  }
+
+  // wgpu render loop: store → meshes → canvas. Sync engine untouched.
+  const viewRef = useRef<{ destroy(): void; stats(): string; renderer: string } | null>(null)
+  const [rendererKind, setRendererKind] = useState('…')
+  // Live pointers for pinch tracking (pointerId → client coords).
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>())
+  const pinchRef = useRef<{ dist: number; midX: number; midY: number } | null>(null)
+  const pinchState = () => {
+    const pts = [...pointersRef.current.values()]
+    if (pts.length < 2) return null
+    const [a, b] = pts
+    return {
+      dist: Math.hypot(b.x - a.x, b.y - a.y),
+      midX: (a.x + b.x) / 2,
+      midY: (a.y + b.y) / 2,
+    }
+  }
+  useEffect(() => {
+    let dead = false
+    let view: { destroy(): void; stats(): string; renderer: string } | null = null
+    ;(async () => {
+      const canvas = canvasRef.current
+      const board = boardRef.current
+      if (!canvas || !board) return
+      board.onChange = stableOnChange
+      board.setViewportSize(canvas.clientWidth, canvas.clientHeight)
+      try {
+        view = await createBoardView(canvas, board, meshProviderRef.current)
+      } catch (err) {
+        setStatus(`canvas init failed: ${err}`)
+        return
+      }
+      if (dead) { view.destroy(); return }
+      viewRef.current = view
+      setRendererKind(view.renderer)
+    })()
+    return () => {
+      dead = true
+      view?.destroy()
+      if (viewRef.current === view) viewRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Space held = temporary pan (mirrors the overlay's own tracking).
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.code === 'Space') spaceRef.current = true }
+    const up = (e: KeyboardEvent) => { if (e.code === 'Space') spaceRef.current = false }
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+    }
+  }, [])
 
   // Tickets without relay hints are undialable (the exact
   // "No addressing information available" failure). The home relay takes
@@ -1838,7 +2355,7 @@ export default function App() {
       setStatus('waiting for relay…')
       await awaitRelay()
       const ticket = await room.ch.ticket({ includeMyself: true, includeBootstrap: true, includeNeighbors: true })
-      await copyText(`${location.origin}${location.pathname}#t=${encodeURIComponent(ticket)}`)
+      await copyText(shareLink(ticket, activeRef.current!))
       // refresh stored ticket
       const docs = docsRef.current.map((d) => (d.id === activeRef.current ? { ...d, ticket, updatedAt: Date.now() } : d))
       setDocsBoth(docs)
@@ -1850,32 +2367,34 @@ export default function App() {
 
   const panel: React.CSSProperties = {
     position: 'absolute', right: 12, bottom: 64, zIndex: 999, width: 300, maxHeight: '70vh', overflowY: 'auto',
-    background: 'rgba(255,255,255,.94)', color: '#1a1d26', padding: 12, borderRadius: 14,
-    boxShadow: '0 8px 32px #0003', backdropFilter: 'blur(8px)',
-    border: '1px solid #00000014', fontSize: 13, fontFamily: 'system-ui',
+    background: PAPER, color: INK, padding: 12, borderRadius: 4,
+    boxShadow: `3px 3px 0 ${INK}`,
+    border: `1.5px solid ${INK}`, fontSize: 13, fontFamily: MONO,
   }
-  // Connection state for the status pill: red = offline, yellow = working,
+  // Connection state for the status stamp: red = offline, yellow = working,
   // green = in a room.
   const conn: 'off' | 'busy' | 'on' =
     !id || /failed/i.test(status) ? 'off'
     : !activeId || /starting|joining|ready/i.test(status) ? 'busy'
     : 'on'
-  const connColor = conn === 'on' ? '#30a46c' : conn === 'busy' ? '#f5a524' : '#e5484d'
+  const connColor = conn === 'on' ? '#2e7d32' : conn === 'busy' ? '#b7791f' : '#c62828'
   const pill: React.CSSProperties = {
     position: 'absolute', right: 12, bottom: 12, zIndex: 1000,
     display: 'flex', alignItems: 'center', gap: 8,
-    background: 'rgba(255,255,255,.94)', color: '#1a1d26', padding: '8px 14px', borderRadius: 999,
-    boxShadow: '0 8px 32px #0003', backdropFilter: 'blur(8px)',
-    border: '1px solid #00000014', fontSize: 13, fontFamily: 'system-ui', fontWeight: 700,
+    background: PAPER, color: INK, padding: '8px 14px', borderRadius: 4,
+    boxShadow: `3px 3px 0 ${INK}`,
+    border: `1.5px solid ${INK}`, fontSize: 13, fontFamily: MONO, fontWeight: 700,
     cursor: 'pointer',
   }
   const btn: React.CSSProperties = {
-    background: '#eef0f6', color: '#1a1d26', border: '1px solid #00000014',
-    borderRadius: 999, padding: '5px 12px', margin: '2px 4px 2px 0', cursor: 'pointer', fontSize: 13,
+    background: CARD_BG, color: INK, border: `1.5px solid ${INK}`,
+    borderRadius: 4, padding: '5px 12px', margin: '2px 4px 2px 0', cursor: 'pointer', fontSize: 13,
+    fontFamily: MONO,
   }
   const input: React.CSSProperties = {
-    width: '100%', margin: '6px 0', background: '#fff', color: '#1a1d26',
-    border: '1px solid #00000022', borderRadius: 8, padding: '5px 8px', fontSize: 12,
+    width: '100%', margin: '6px 0', background: PAPER, color: INK,
+    border: `1.5px solid ${INK}`, borderRadius: 4, padding: '5px 8px', fontSize: 12,
+    fontFamily: MONO, boxSizing: 'border-box',
   }
   const names = Object.entries(online)
   const activeDoc = docs.find((d) => d.id === activeId)
@@ -1893,34 +2412,36 @@ export default function App() {
   const myDocs = docs.filter((d) => d.owner === id)
   const sharedDocs = docs.filter((d) => d.owner !== id)
 
-  // Full zoom-out: opaque home screen, no whiteboard behind. Projects are
-  // a rolodex drum you roll through vertically.
+  // Full zoom-out: opaque engineering-pad home screen, no whiteboard
+  // behind. Projects are a rolodex drum you roll through vertically.
   const overlayBack: React.CSSProperties = {
-    position: 'fixed', inset: 0, zIndex: 2000, background: '#eceef4',
+    ...paperGrid,
+    position: 'fixed', inset: 0, zIndex: 2000,
     display: 'flex', alignItems: 'stretch', justifyContent: 'center',
-    fontFamily: 'system-ui',
+    fontFamily: MONO, color: INK,
   }
   const sheet: React.CSSProperties = {
-    background: '#eceef4', color: '#1a1d26', padding: 24,
+    ...paperGrid, color: INK, padding: 24,
     width: '100%', maxWidth: 1100, height: '100%', overflowY: 'auto',
   }
   const deckCard: React.CSSProperties = {
     height: '100%', boxSizing: 'border-box',
-    border: '1px solid #00000014', borderRadius: 20, padding: 18, cursor: 'pointer',
-    background: '#fff', boxShadow: '0 12px 40px #0002',
+    border: `1.5px solid ${INK}`, borderRadius: 4, padding: 18, cursor: 'pointer',
+    background: CARD_BG, boxShadow: `3px 3px 0 ${INK}`,
     display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+    fontFamily: MONO, color: INK,
   }
-  const deckCardActive: React.CSSProperties = { ...deckCard, border: '2px solid #1a1d26' }
+  const deckCardActive: React.CSSProperties = { ...deckCard, border: `3px solid ${INK}` }
   const cardGrid: React.CSSProperties = {
     display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 12,
   }
   const card: React.CSSProperties = {
-    border: '1px solid #00000014', borderRadius: 16, padding: 14, cursor: 'pointer',
-    background: '#f7f8fc',
+    border: `1.5px solid ${INK}`, borderRadius: 4, padding: 14, cursor: 'pointer',
+    background: CARD_BG, fontFamily: MONO, color: INK,
   }
-  const cardActive: React.CSSProperties = { ...card, border: '2px solid #1a1d26', background: '#fff' }
+  const cardActive: React.CSSProperties = { ...card, border: `3px solid ${INK}` }
   const tabBtn = (active: boolean): React.CSSProperties => ({
-    ...btn, background: active ? '#1a1d26' : '#eef0f6', color: active ? '#fff' : '#1a1d26',
+    ...btn, background: active ? INK : CARD_BG, color: active ? PAPER : INK,
     fontWeight: 700,
   })
 
@@ -1932,7 +2453,9 @@ export default function App() {
     setShowAdd(false)
     setStatus('joining…')
     try {
-      const roomId = await ensureRoom(peer.trim(), nick.current)
+      const { ticket, key } = splitTicketInput(peer)
+      const roomId = await ensureRoom(ticket.trim(), nick.current)
+      if (key) saveKey(roomId, key)
       switchDoc(roomId)
       sendMsg({ t: 'snap-req' })
       setPeer('')
@@ -1980,7 +2503,7 @@ export default function App() {
             ? <button style={btn} onClick={() => setShowAdd(true)}>⤵ join with ticket</button>
             : (
               <div>
-                <input placeholder="paste ticket…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
+                <input placeholder="paste ticket or share link…" value={peer} onChange={(e) => setPeer(e.target.value)} style={input} />
                 <button style={btn} onClick={joinTicket}>join</button>
               </div>
             )}
@@ -2027,40 +2550,125 @@ export default function App() {
     </div>
   )
   return (
-    <div style={{ position: 'fixed', inset: 0 }}>
-      <Excalidraw
-        excalidrawAPI={onApi}
-        onChange={stableOnChange}
-        onPointerUpdate={stableOnPointerUpdate}
-        isCollaborating
-        renderTopRightUI={stableTopRight}
+    <div ref={paperRef} style={{ position: 'fixed', inset: 0, ...paperGrid }}>
+      {/* Rust canvas: wgpu surface, transparent over the CSS grid. */}
+      <canvas
+        id="board"
+        ref={canvasRef}
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', touchAction: 'none' }}
+        onPointerDown={onCanvasPointerDown}
+        onPointerMove={onCanvasPointerMove}
+        onPointerUp={onCanvasPointerUp}
+        onPointerCancel={onCanvasPointerUp}
+        onWheel={onCanvasWheel}
       />
-      {/* Top-left project breadcrumb: the primary way to back out to projects. */}
+      {/* Tool cluster: pen draws, eraser deletes, pan moves. */}
+      <div
+        style={{
+          position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 1000,
+          display: 'flex', gap: 6, alignItems: 'center',
+          background: PAPER, color: INK,
+          border: `2px solid ${INK}`, borderRadius: 4,
+          boxShadow: `3px 3px 0 ${INK}`,
+          padding: '4px 6px', fontFamily: MONO, fontSize: 12, fontWeight: 700,
+        }}
+      >
+        {([
+          ['pen', '✏ PEN', 'tool-pen'],
+          ['eraser', '⌫ ERASE', 'tool-eraser'],
+          ['pan', '✥ PAN', 'tool-pan'],
+        ] as const).map(([t, label, testid]) => (
+          <button
+            key={t}
+            data-testid={testid}
+            style={{
+              ...btn, margin: 0,
+              background: tool === t ? INK : CARD_BG,
+              color: tool === t ? PAPER : INK,
+              fontWeight: 700,
+            }}
+            onClick={() => setTool(t)}
+          >{label}</button>
+        ))}
+      </div>
+      {/* Pen capture: pencil input owned by the pen crate. Commits land
+          as ordinary freedraw elements through onChange (sync untouched). */}
+      <PenOverlay
+        apiRef={apiRef}
+        armed={tool === 'pen'}
+        onError={(msg) => setStatus(msg)}
+        onStroke={(el) => {
+          const a = apiRef.current
+          if (!a) return
+          a.updateScene({ elements: [...a.getSceneElements(), el] as any[] })
+        }}
+      />
+      {/* TOPS title block: hidden until summoned. Small stamp button
+          toggles the full header (project/board/page/date + back-out). */}
+      {!showHeader ? (
+        <button
+          style={{
+            position: 'absolute', top: 12, left: 12, zIndex: 1000,
+            background: PAPER, color: INK,
+            border: `2px solid ${INK}`, borderRadius: 4,
+            boxShadow: `3px 3px 0 ${INK}`,
+            fontFamily: MONO, fontSize: 14, fontWeight: 800,
+            padding: '4px 10px', cursor: 'pointer',
+          }}
+          onClick={() => setShowHeader(true)}
+          title="Show header"
+        >✦</button>
+      ) : (
       <div
         style={{
           position: 'absolute', top: 12, left: 12, zIndex: 1000,
-          display: 'flex', alignItems: 'center', gap: 8,
-          background: 'rgba(255,255,255,.94)', color: '#1a1d26',
-          padding: '6px 8px', borderRadius: 12,
-          boxShadow: '0 8px 32px #0003', backdropFilter: 'blur(8px)',
-          border: '1px solid #00000014', fontSize: 13, fontFamily: 'system-ui',
-          maxWidth: 'min(480px, 70vw)',
+          background: PAPER, color: INK,
+          border: `2px solid ${INK}`, borderRadius: 4,
+          boxShadow: `3px 3px 0 ${INK}`,
+          fontSize: 12, fontFamily: MONO,
+          maxWidth: 'min(480px, 70vw)', overflow: 'hidden',
         }}
       >
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          borderBottom: `1.5px solid ${INK}`, padding: '4px 8px',
+          fontWeight: 800, letterSpacing: 1,
+        }}>
+          <span style={{ width: 8, height: 8, borderRadius: 999, background: connColor, display: 'inline-block', flexShrink: 0 }} />
+          LIVE DRAW · ENG. PAD
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px' }}>
+          <button
+            style={{ ...btn, margin: 0, fontWeight: 700 }}
+            onClick={() => setView('topics')}
+            title="Back out to projects"
+          >← PROJECTS</button>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }}>
+            {activeDoc ? `${activeDoc.name}` : 'No project open'}
+            {activePage && activeDoc ? ` / SHT ${activeDoc.pages.find((p) => p.id === activePage)?.name ?? ''}` : ''}
+          </span>
+        </div>
+        {activeDoc && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px',
+            borderTop: `1.5px solid ${INK}`, opacity: 0.85,
+          }}>
+            <span>PG {Math.max(0, activeDoc.pages.findIndex((p) => p.id === activePage)) + 1} OF {activeDoc.pages.length}</span>
+            <span style={{ flex: 1 }} />
+            <span ref={sheetPageRef}>SHEET-PG 1</span>
+            <span>{todayName()}</span>
+          </div>
+        )}
         <button
-          style={{ ...btn, margin: 0, fontWeight: 700 }}
-          onClick={() => setView('topics')}
-          title="Back out to projects"
-        >← Projects</button>
-        <span style={{ width: 8, height: 8, borderRadius: 999, background: connColor, display: 'inline-block', flexShrink: 0 }} />
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }}>
-          {activeDoc ? `${activeDoc.name}` : 'No project open'}
-          {activePage && activeDoc ? ` / ${activeDoc.pages.find((p) => p.id === activePage)?.name ?? ''}` : ''}
-        </span>
+          style={{ ...btn, margin: 0, width: '100%', borderLeft: 'none', borderRight: 'none', borderBottom: 'none', borderRadius: 0 }}
+          onClick={() => setShowHeader(false)}
+          title="Hide header"
+        >✕ HIDE</button>
       </div>
+      )}
       <button style={{ ...pill, cursor: 'default' }} title={status}>
         <span style={{ width: 10, height: 10, borderRadius: 999, background: connColor, display: 'inline-block' }} />
-        ✦ live draw
+        ENG.PAD
         <span style={{ fontWeight: 400, opacity: 0.65, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {activeDoc ? `${activeDoc.name}` : status}
         </span>
@@ -2098,7 +2706,7 @@ export default function App() {
                   const bname = activeDoc.pages.find((p) => p.id === h.boardId)?.name ?? h.boardId.slice(0, 6)
                   return (
                     <div key={h.id} style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, padding: '3px 0' }}>
-                      <span style={{ background: '#fff34d', borderRadius: 4, padding: '0 6px', fontWeight: 700 }}>{h.date}</span>
+                      <span style={{ background: PAPER, border: `1.5px solid ${INK}`, borderRadius: 4, padding: '0 6px', fontWeight: 700 }}>{h.date}</span>
                       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bname} · {h.elementIds.length} els</span>
                       <button style={{ ...btn, padding: '1px 8px', fontSize: 11 }} onClick={() => jumpToHighlight(h)}>go</button>
                       <button style={{ ...btn, padding: '1px 8px', fontSize: 11 }} onClick={() => deleteHighlight(h.id)}>✕</button>
@@ -2124,15 +2732,9 @@ export default function App() {
             await copyText(JSON.stringify(apiRef.current?.getSceneElements() ?? []))
             alert('Copied JSON — paste into any agent')
           }}>agent JSON</button>
-          <button style={btn} onClick={async () => {
-            const a = apiRef.current
-            if (!a) return
-            const svg = await exportToSvg({ elements: a.getSceneElements(), appState: a.getAppState(), files: a.getFiles() })
-            await copyText(svg.outerHTML)
-            alert('Copied SVG')
-          }}>SVG</button>
         </div>
         <div style={{ opacity: 0.6, marginTop: 4, fontSize: 12 }}>{status}{activeDoc ? ` · ${activeDoc.name}` : ''}{activePage ? ` / ${activeDoc?.pages.find((p) => p.id === activePage)?.name ?? ''}` : ''}</div>
+        <div style={{ opacity: 0.6, marginTop: 2, fontSize: 12 }}>renderer: {rendererKind}</div>
         {DEBUG && <div style={{ opacity: 0.6, marginTop: 2, fontSize: 12 }}>💾 {saveInfo}</div>}
         {DEBUG && <button style={btn} onClick={() => setShowDbg((s) => !s)}>debug</button>}
         {DEBUG && <button style={btn} onClick={() => {
@@ -2152,7 +2754,11 @@ export default function App() {
         <div style={overlayBack} onClick={() => { if (activeId) setView(null) }}>
           <div style={sheet} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
-              <span style={{ fontWeight: 800, fontSize: 20 }}>✦ live draw</span>
+              <span style={{
+                fontWeight: 800, fontSize: 20, letterSpacing: 1,
+                border: `2px solid ${INK}`, borderRadius: 4, padding: '2px 12px',
+                background: PAPER, boxShadow: `3px 3px 0 ${INK}`,
+              }}>✦ LIVE DRAW</span>
               <span style={{ width: 8, height: 8, borderRadius: 999, background: connColor, display: 'inline-block' }} />
               <span style={{ flex: 1 }} />
               {activeId && view !== null && (

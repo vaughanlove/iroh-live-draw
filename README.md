@@ -1,68 +1,158 @@
-# p2p whiteboard with iroh
+# live draw · engineering pad
 
-*Experimental - there is no authentication. If someone knows your ticket, they can join as a peer.*
+A peer-to-peer whiteboard styled as a TOPS engineering pad: pale-green graph
+paper, monospace title blocks, fixed-width boards that scroll infinitely
+downward with ruled sheet breaks. Peers draw together over iroh; an
+always-on keeper holds snapshots so newcomers converge while the owner is
+offline.
 
-Inspired by wanting to integrate my tablet more deeply into my workflows.
+*Experimental — no encryption yet. A share ticket is a bearer credential:
+anyone holding it can join as a peer. See Security.*
 
-A vite webserver with a excalidraw canvas paired with iroh running over wasm. Iroh dials your peer(s) and establishes a bidirectional QUIC connection. 
+## Concepts
 
-![demo](./minidemo.gif)
+- **Project** — the highest unit. Sharing links a peer to a project
+  (capabilities are basic on purpose; formalize later).
+- **Board** — a fixed-width (816-unit letter) sheet inside a project that
+  runs infinitely downward. Boards start at the top; the header reads
+  `PG x OF n · SHEET-PG k · date`.
+- **Highlight** — a dated selection of board elements; the future project
+  map assembles highlights. (Replaces the old daily-note / project-map
+  pages, which are deprecated.)
+- **Home** — a full-screen rolodex drum of projects (roll with wheel,
+  touch, ↑/↓, or click a card to bring it front, click again to open).
+  No whiteboard behind it.
 
-Docs are topics. A topic owns board (the classic endless excalidraw whiteboard), letters (paginated board that has a set size), and dailies (which are a single page). One peer owns the doc and holds the source of truth; anyone may draw, and the ⟳ sync button pulls the owner's full state over yours. Owners can revoke peers (firewall replicated to every node).
+## Architecture
 
-## Build 
-1. Have the wasm32-unknown-unknown target installed: `rustup target add wasm32-unknown-unknown`. I'm running an intel macbook, so Apple clang can't build ring for wasm - (in my case) use zig instead:
+```
+web/            Vite + React shell (panels, rolodex, peers, header)
+  src/App.tsx       sync engine: CRDT claims, gossip I/O, snapshots, firewall
+  src/board.ts      scene store + camera (replaced Excalidraw's canvas)
+  src/boardView.ts  rAF renderer: hardware wgpu → software wgpu → CPU 2D
+  src/PenOverlay.tsx pencil capture (arms on the pen tool only)
+shared/         protocol core: tickets, signed messages, firewall, gossip join
+                  compiled to native AND wasm (single source of truth)
+browser-wasm/   wasm peer: join/create rooms, keeper snapshot fetch
+pen/            hand-drawn stroke pipeline + renderer
+                  model → smooth → outline → render / wasm
+                  pressure-aware variable width + monoline sharpie mode,
+                  wgpu renderer (transparent over the CSS grid),
+                  Excalidraw-freedraw interop both directions
+keeper/         always-on watch peer: merges gossip into RAM, persists
+                  state.json every 30s, answers snap-req + direct QUIC fetch
+relay/          stock iroh-relay behind TLS-terminating proxy (Railway)
+e2e/            headless-Chromium harness (puppeteer): liveness, CRDT,
+                  keeper-offline, rejoin, live scenarios + WebKit probe
+```
+
+The transport is element-JSON-agnostic: gossip carries versioned freedraw
+blobs, the keeper merges them opaquely, and LWW-element-map (version, ts,
+author) with tombstones converges everything. The firewall is
+authorization (who may affect state), not confidentiality.
+
+Rendering: every stroke draws sharpie-style — one uniform centerline, no
+triangle seams, pixel-identical overlaps. Tools are pen / eraser / pan
+(two-finger pinch zooms on touch). Deliberately absent: selection,
+undo/redo, text editing, embeds, image rendering (binaries still sync).
+
+## Build
+
+Prereqs (pinned via mise — `mise install`): node 24, rust stable.
+
+```sh
+# 1. browser peer bindings (Intel Mac: zig toolchain for ring, see below)
+cargo zigbuild --release --target wasm32-unknown-unknown -p draw-browser-wasm
+wasm-bindgen target/wasm32-unknown-unknown/release/draw_browser_wasm.wasm \
+  --out-dir web/src/pkg --target bundler
+
+# 2. pen bindings (bench bundle + app bundle)
+mise run pen-wasm
+
+# 3. frontend
+cd web && npm i && npm run build
+```
+
+Apple-Clang can't build `ring` for wasm on Intel Macs — use zig instead:
+
 ```sh
 cargo install cargo-zigbuild wasm-bindgen-cli
 export PATH="$HOME/.local/zig/zig-x86_64-macos-0.16.0:$PATH"
 ```
-Do not use wasm-pack or plain cargo build here, and do not set CC_wasm32_unknown_unknown. Both fail.
 
-2. Build the bindings:
-```sh
-cargo zigbuild --release --target wasm32-unknown-unknown -p draw-browser-wasm
-wasm-bindgen target/wasm32-unknown-unknown/release/draw_browser_wasm.wasm \
-  --out-dir web/src/pkg --target bundler
-```
-
-3. Build the frontend:
-```sh
-cd web && npm i && npm run build
-```
+`mise run` tasks: `keeper`, `web` (dev server), `serve` (:8080 static),
+`wasm`, `pen-wasm`, `build`, `e2e --scenario live|crdt|keeper|rejoin|liveness`.
 
 ## Run
+
 ```sh
-cargo run --  # serves web/dist (LISTEN=0.0.0.0:8080, WEB_DIR=web/dist)
-# For local testing, open http://<device-lan-ip>:8080. Note that iroh will not let you tunnel between two localhost instances of this application. 
+mise run keeper   # :8081 (LISTEN, KEEPER_DATA, KEEPER_TOKEN, RELAY_URL, MAX_TOPICS)
+mise run serve    # :8080 serves web/dist
+# dev alternative: `npm run dev` in web/ (debug drawer via .env.development)
 ```
-Dev alternative: `npm run dev` in web/. That turns on the debug drawer, save indicator, and clear-cache button (also available on any build with `?debug=1`).
+
+Local testing note: iroh won't tunnel between two localhost instances —
+use the LAN IP (`http://<lan-ip>:8080`) for device-to-device, or the e2e
+harness for same-machine peers.
+
+**Pen test bench:** `/pen/` — pointer samples → Rust `PenStroke` → mesh →
+Canvas2D. Size slider, sharpie toggle, square/iso grid toggle, frame-time
+readout. The feel-tuning surface.
 
 ## Connect
-Hit **⧉ share** to copy a link for the current doc. Open it on the other device and you're in the same topic. Draw - changes sync realtime (batched deltas over gossip, LWW-element-map CRDT with tombstones, so deletes converge and snapshots merge instead of clobbering). Paste an image and the binary follows the elements.
 
-State lives in the browser (localStorage per doc page: elements, CRDT claims, tombstones, files). Refresh restores it. Clear-cache wipes it.
+**⧉ share** copies a link for the current project. Open it on the other
+device to join. State lives in browser localStorage per board (elements,
+CRDT claims, tombstones, files); refresh restores it.
 
-## Keeper (always-on watch peer) + custom relay
+Query overrides (no rebuild): `?relay=`, `?keeper=`, `?debug=1`, `?fresh=1`
+(ephemeral identity for same-browser testing).
 
-Two Railway services, one repo:
+## Keeper + relay (Railway, defined in `.railway/railway.ts`)
 
-- `relay/Dockerfile` — stock `n0computer/iroh-relay` plus a tiny entrypoint that renders config from `$PORT`. Railway terminates TLS, so the relay runs plain HTTP behind the proxy.
-- `keeper/` — a Rust binary that joins docs as a dumb cache. Browsers POST tickets to `POST /watch` on boot and doc switch, so the keeper rejoins everything automatically. It merges what it sees (same CRDT rules) and answers `snap-req` when the owner is offline. It never answers `pull` and never edits. Newcomers can also fetch snapshots straight from it over QUIC (no gossip mesh needed) when gossip is being difficult.
+Two services, one repo: `relay` (stock image + entrypoint rendering config
+from `$PORT`) and `keeper` (root Dockerfile). Browsers need relay-routed
+traffic (wasm can't hole-punch); Railway has no UDP ingress, which is fine
+for exactly that reason.
 
-Point a build at them with env (or `?relay=` / `?keeper=` query overrides, no rebuild needed):
+| env | where | meaning |
+|---|---|---|
+| `RELAY_URL` | keeper, `VITE_RELAY_URL` web | own relay (compiled default is ours; n0 is gone) |
+| `VITE_KEEPER_URL` | web | keeper public URL |
+| `VITE_KEEPER_TOKEN` / keeper `KEEPER_TOKEN` | both | optional bearer for `POST /watch` |
+| `KEEPER_DATA`, `MAX_TOPICS`, `LISTEN` | keeper | storage, caps, bind |
+
+## E2E
 
 ```sh
-VITE_RELAY_URL=https://<relay>.up.railway.app
-VITE_KEEPER_URL=https://<keeper>.up.railway.app
-VITE_KEEPER_TOKEN=...   # optional, must match keeper's KEEPER_TOKEN
+mise run serve & mise run keeper &   # terminals 1+2
+APP_URL=http://<lan-ip>:8080 RELAY_URL=<relay> mise run e2e --scenario live
 ```
 
-Local dev defaults live in `web/.env.development` (keeper on :8081, n0 relays). Run the keeper locally with `cargo run -p keeper` (`LISTEN`, `KEEPER_DATA`, `KEEPER_TOKEN`, `RELAY_URL`, `MAX_TOPICS` envs).
+Scenarios drive the real UI (`+ new project`, `← PROJECTS`, tools `⋯`,
+`sync`) with `?debug=1` + the `window.__draw` hook (scene, tombs, meta,
+stats, diag, mesh, scroll, gpu). Logs land in `e2e/logs/`.
 
-Env needed on Railway: keeper gets `RELAY_URL` pointing at the relay service; browsers get the two public URLs above. Railway has no UDP ingress so QUIC address discovery is off — relay-routed traffic (everything browsers need) works fine.
+## Security (honest)
 
-## Future work
+- Transport is **signed** (Ed25519, unspoofable senders) and every project
+  now carries a **data key**: share links are `#t=<ticket>&k=<key>`, where
+  the ticket routes + authorizes (keeper sees it) and the key decrypts
+  (peers only — never POSTed anywhere, never in tickets).
+- Board content + image binaries travel as **AES-GCM-256 envelopes**;
+  CRDT claims (id, version, ts, author) and tombstones ride cleartext so
+  the keeper merges without reading. Keeper disk holds ciphertext.
+- The firewall is authorization (who may *affect* state), not
+  confidentiality. Tickets stay bearer credentials; a bare ticket joins
+  keyless and sees nothing (by design — the e2e asserts this implicitly).
+- Local browser storage stays plaintext (device trust boundary).
+- Lost key = lost access: no recovery except a fresh share link from a
+  member. Rotation without resharing is future work (Noise re-keying).
+- Firewall snapshots, presence, highlights (ids only) stay cleartext.
 
-- Automatic stroke to .typ file
-- Tombstone GC via version vectors (per-sender seq already exists); extract the CRDT + identity layers into crates once converged
-- Experiment with DiffusionGemma or Jev generating AI-assisted strokes
+## Future
+
+- Blind keeper (per-project AEAD envelopes, cleartext CRDT claims).
+- Native app (full iroh: direct QUIC, discovery; the mesh replaces keeper).
+- Pen render parity gaps: image/text rendering, selection, undo.
+- Tombstone GC via version vectors; extract CRDT + identity into crates.

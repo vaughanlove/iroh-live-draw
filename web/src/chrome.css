@@ -1,3 +1,22 @@
+/* TOPS engineering-pad chrome. The app body is graph paper: pale green
+   #D8E8D0 with a dark-green #7BAE7B grid at 20px, lines slightly
+   translucent. All type is monospace. Component colors live in App.tsx
+   (PAPER/INK theme constants); this file holds the page base plus the
+   Excalidraw chrome we hide in favor of our own UI. */
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background-color: #d8e8d0;
+  background-image:
+    linear-gradient(rgba(123, 174, 123, 0.4) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(123, 174, 123, 0.4) 1px, transparent 1px);
+  background-size: 20px 20px;
+  font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+  color: #1e4620;
+}
+
 /* Hide Excalidraw chrome we replace with our own UI:
    hamburger menu (top-left), collab button and library (top-right).
    Drawing toolbar, zoom controls, and undo/redo stay. */

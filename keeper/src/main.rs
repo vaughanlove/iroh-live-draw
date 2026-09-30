@@ -130,6 +130,8 @@ struct WatchedDoc {
     last_rx_ms: Mutex<u128>,
     /// Every peer we've heard from (rejoin bootstrap candidates).
     seen: Mutex<HashSet<String>>,
+    /// Last snap-req we sent (late-join catch-up, debounced).
+    last_snap_req_ms: Mutex<u128>,
 }
 
 impl std::fmt::Debug for WatchedDoc {
@@ -245,6 +247,7 @@ impl Keeper {
                 fw_version: Mutex::new(0),
                 last_rx_ms: Mutex::new(now_ms()),
                 seen: Mutex::new(HashSet::new()),
+                last_snap_req_ms: Mutex::new(0),
             });
             entry.ticket = ticket_str.to_string();
             if let Some(pages) = restore {
@@ -381,6 +384,31 @@ impl Keeper {
                     self.on_message(topic, &m).await;
                 }
                 Event::Presence { .. } => {}
+                Event::NeighborUp { .. } | Event::Joined { .. } => {
+                    // Mesh (re)formed with live peers: pull current state.
+                    // Without this the keeper only learns what is broadcast
+                    // AFTER it joins — a late joiner hears history never.
+                    let pages: Vec<String> = {
+                        let docs = self.docs.lock().expect("poisoned");
+                        let Some(doc) = docs.get(&topic) else { continue };
+                        let mut known: Vec<String> = doc.pages.keys().cloned().collect();
+                        if !known.iter().any(|p| p == "main") {
+                            known.push("main".to_string());
+                        }
+                        let mut last = doc.last_snap_req_ms.lock().expect("poisoned");
+                        if now_ms().saturating_sub(*last) <= 30_000 {
+                            continue;
+                        }
+                        *last = now_ms();
+                        known
+                    };
+                    let me = self.me.clone();
+                    for pg in pages {
+                        if let Some(doc) = self.docs.lock().expect("poisoned").get(&topic) {
+                            doc.send(&me, serde_json::json!({ "t": "snap-req", "page": pg }));
+                        }
+                    }
+                }
                 _ => {}
             }
         }

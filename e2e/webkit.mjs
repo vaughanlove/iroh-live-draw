@@ -25,8 +25,15 @@ try {
   A.on('dialog', async (d) => { await d.accept('e2e-project'); });
   await A.goto(`${APP_URL}/?debug=1`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(8000);
-  // open projects home via ← Projects, create project
-  await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '← Projects').click());
+  // summon the hidden title block, open projects home, create project
+  await A.evaluate(() => {
+    const btns = [...document.querySelectorAll('button')];
+    if (!btns.some((b) => b.textContent.trim() === '← PROJECTS')) {
+      btns.find((b) => b.textContent.trim() === '✦')?.click();
+    }
+  });
+  await sleep(500);
+  await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '← PROJECTS').click());
   await sleep(500);
   await A.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ new project').click());
   await sleep(6000);

@@ -1,0 +1,28 @@
+[package]
+name = "pen"
+version = "0.1.0"
+edition = "2021"
+description = "Hand-drawn stroke pipeline + renderer for live-draw. Pressure-aware variable-width strokes with smoothing (xournal++ feel), rendered as filled polygons over wgpu. Geometry core is dependency-light and wasm-safe; the wgpu renderer targets native first, wasm32 via WebGPU."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# wasm-bindgen API surface (geometry + camera + GPU canvas for a JS embedder).
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures"]
+
+[dependencies]
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["HtmlCanvasElement", "Window", "Document"] }
+
+[dev-dependencies]
+serde_json = "1"
+pollster = "0.4"

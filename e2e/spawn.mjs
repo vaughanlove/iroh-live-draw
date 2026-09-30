@@ -61,24 +61,45 @@ async function openTab(browser, name, url) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Share link for a doc, as the app copies it: ticket + data key (the key
+// lives in localStorage, never in the ticket — bare tickets join keyless
+// and can't decrypt, by design).
+async function shareLink(page, docId, ticket) {
+  const key = await page.evaluate((k) => {
+    try { return localStorage.getItem(k) } catch { return null }
+  }, `draw.key.${docId}`);
+  const frag = `t=${encodeURIComponent(ticket)}${key ? `&k=${encodeURIComponent(key)}` : ''}`;
+  return `${APP_URL}/?fresh=1&debug=1#${frag}`;
+}
+
 // DOM helpers (no app code changes needed: drive the real UI).
 async function pillText(page) {
   return page.evaluate(() => {
     const btns = [...document.querySelectorAll('button')];
-    const pill = btns.find((b) => b.textContent?.includes('live draw') && b.textContent.length < 120);
+    const pill = btns.find((b) => b.textContent?.includes('ENG.PAD') && b.textContent.length < 120);
     return pill ? pill.textContent.trim().slice(0, 160) : '(no pill)';
   });
 }
 async function projectsButton(page) {
-  // Top-left breadcrumb opens the projects home (the status pill is display-only).
+  // Title block hides behind the ✦ stamp: summon it first, then find ← PROJECTS.
   return page.evaluate(() => {
     const btns = [...document.querySelectorAll('button')];
-    return btns.findIndex((b) => b.textContent?.trim() === '← Projects');
+    let idx = btns.findIndex((b) => b.textContent?.trim() === '← PROJECTS');
+    if (idx < 0) {
+      const stamp = btns.findIndex((b) => b.textContent?.trim() === '✦');
+      if (stamp >= 0) btns[stamp].click();
+      return -2; // summoned; caller retries
+    }
+    return idx;
   });
 }
 async function openPanel(page) {
-  // ← Projects opens the projects home; Peers tab holds the roster.
-  const idx = await projectsButton(page);
+  // ← PROJECTS opens the projects home; Peers tab holds the roster.
+  let idx = await projectsButton(page);
+  if (idx === -2) {
+    await sleep(500);
+    idx = await projectsButton(page);
+  }
   if (idx >= 0) await page.evaluate((i) => [...document.querySelectorAll('button')][i].click(), idx);
   await sleep(500);
 }
@@ -150,7 +171,9 @@ async function scenarioLiveness() {
     // Guest tab, same browser profile (shared localStorage, distinct tab id).
     // Guest tab: ?fresh=1 gives it an ephemeral id (same-browser tabs
     // share the base identity, so testing needs the explicit hatch).
-    const B = await openTab(browser, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    // Same profile shares the data key too — the link form is still used
+    // so the join path matches reality.
+    const B = await openTab(browser, 'guest', await shareLink(A, docId, ticket));
     await sleep(10000);
     log('guest', 'pill:', await pillText(B));
     await openPeers(B);
@@ -215,7 +238,7 @@ async function scenarioCrdt() {
     await sleep(6000);
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     if (!docs.length || !docs[0].ticket) throw new Error('no ticket');
-    const B = await openTab(browser, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(docs[0].ticket)}`);
+    const B = await openTab(browser, 'guest', await shareLink(A, docs[0].id, docs[0].ticket));
     await sleep(10000);
 
     // 1. create on owner -> converges to guest
@@ -235,9 +258,9 @@ async function scenarioCrdt() {
     log('crdt', 'guest rect gone:', !g2.includes(id1), '| owner tombs:', JSON.stringify(tombs));
 
     // 3. guest reload -> no resurrection from snapshot merge.
-    // Re-navigate (not reload) so ?fresh=1&debug=1 and the ticket survive;
+    // Re-navigate (not reload) so ?fresh=1&debug=1 and the link survive;
     // the app strips the hash after joining.
-    const guestUrl = `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(docs[0].ticket)}`;
+    const guestUrl = await shareLink(B, docs[0].id, docs[0].ticket);
     await B.goto(guestUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); await sleep(2000);
     await sleep(12000);
     const g3 = await sceneIds(B);
@@ -288,17 +311,26 @@ async function scenarioCrdt() {
     await sleep(8000);
     const sB2 = (await sceneIds(B)).sort();
     // Owner is parked on another board: B must equal the owner's STORED
-    // state for the guest's board, not the owner's live scene.
+    // board state, not the owner's live (new-board) scene. Same-profile
+    // tabs share one localStorage, so B's own persists (with soft-marked
+    // tombstones) cross-contaminate the shared snapshot: filter ids the
+    // stored tombstones condemn, mirroring CRDT truth.
     const ownerDocs = JSON.parse((await drawApi(A, 'lsGet', 'draw.docs')) ?? '[]');
     const odoc = ownerDocs.sort((a, b) => b.updatedAt - a.updatedAt)[0];
     const boardPage = odoc.pages[0];
     const stored = JSON.parse((await drawApi(A, 'lsGet', `draw.snap.${odoc.id}.${boardPage.id}`)) ?? '[]').map((e) => e.id).sort();
-    log('crdt', 'pull overwrote:', JSON.stringify(sB2) === JSON.stringify(stored), `owner-board:${JSON.stringify(stored)} B:${JSON.stringify(sB2)}`);
+    const storedTombs = JSON.parse((await drawApi(A, 'lsGet', `draw.tombs.${odoc.id}.${boardPage.id}`)) ?? '{}');
+    const storedLive = stored.filter((id) => !storedTombs[id]);
+    log('crdt', 'pull overwrote:', JSON.stringify(sB2) === JSON.stringify(storedLive), `owner-board:${JSON.stringify(storedLive)} B:${JSON.stringify(sB2)}`);
     // 6. keeper serves while owner is offline: close everything, fresh
     //    join with a FRESH ticket (refreshed tickets carry keeper + relays;
     //    the scenario-start ticket predates them). Keeper answers.
+    //    Clear the stored last-viewed page first: same-profile tabs share
+    //    localStorage, but a true newcomer has no viewing history and must
+    //    land on the first board (where the content is).
     const freshDocs = JSON.parse((await drawApi(B, 'lsGet', 'draw.docs')) ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     const ticket = freshDocs[0].ticket;
+    await drawApi(B, 'lsDel', `draw.activepage.${freshDocs[0].id}`);
     await A.close();
     await B.close();
     await sleep(2000);
@@ -334,9 +366,10 @@ async function scenarioKeeper() {
     const ticket = docs[0].ticket;
     log('keeper-test', 'ticket bytes:', ticket.length);
     await sleep(10000); // let keeper merge
+    const newcomerUrl = await shareLink(A, docs[0].id, ticket);
     await A.close();
     await sleep(2000);
-    const C = await openTab(other, 'newcomer', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    const C = await openTab(other, 'newcomer', newcomerUrl);
     for (let i = 0; i < 10; i++) {
       await sleep(2000);
       const d = await drawApi(C, 'diag');
@@ -375,7 +408,7 @@ async function scenarioRejoin() {
     const idA = await drawApi(A, 'addRect');
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     const ticket = docs[0].ticket;
-    const B = await openTab(other, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    const B = await openTab(other, 'guest', await shareLink(A, docs[0].id, ticket));
     await sleep(10000);
     log('rejoin', 'both converged:', JSON.stringify(await sceneIds(A)), JSON.stringify(await sceneIds(B)));
     log('rejoin', 'A apiCalls:', JSON.stringify(await drawApi(A, 'apiCalls')));
@@ -434,7 +467,7 @@ async function scenarioLive() {
     await sleep(6000);
     const docs = JSON.parse((await ls(A))['draw.docs'] ?? '[]').sort((a, b) => b.updatedAt - a.updatedAt);
     const ticket = docs[0].ticket;
-    const B = await openTab(other, 'guest', `${APP_URL}/?fresh=1&debug=1#t=${encodeURIComponent(ticket)}`);
+    const B = await openTab(other, 'guest', await shareLink(A, docs[0].id, ticket));
     await sleep(12000);
     // A draws AFTER B joined.
     const idA = await drawApi(A, 'addRect');
