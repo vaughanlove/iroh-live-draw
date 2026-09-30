@@ -224,14 +224,40 @@ impl PenCanvas {
 
     pub fn end_frame(&mut self) {
         // wgpu 30 presents on drop: submit work, then release the frame.
-        // One pass over staged retained buffers: camera moves upload nothing.
+        // One pass: opaque paper clear, grid geometry, staged ink.
+        // Opaque throughout — compositor alpha proved unreliable across
+        // drivers (black canvas in production), so the paper lives in the
+        // frame instead of underneath it.
         let Some(fr) = self.frame.take() else { return };
         let staged = std::mem::take(&mut self.staged);
+        use wgpu::util::DeviceExt as _;
+        // Grid buffers precede the pass: the pass borrow outlives them.
+        let (gverts, gidx) = crate::render::grid_mesh(&self.cam);
+        let grid: Option<crate::render::StrokeMesh> = if gidx.is_empty() {
+            None
+        } else {
+            let gv = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pen.grid-v"),
+                contents: bytemuck::cast_slice(&gverts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let gi = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pen.grid-i"),
+                contents: bytemuck::cast_slice(&gidx),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            Some(crate::render::StrokeMesh {
+                vertex_buf: gv,
+                index_buf: gi,
+                index_count: gidx.len() as u32,
+            })
+        };
         let view = fr.frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (target, resolve) = match &self.ms_view {
             Some(ms) => (ms, Some(&view)),
             None => (&view, None),
         };
+        let paper = crate::render::PAPER;
         let mut enc = fr.encoder;
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -242,7 +268,12 @@ impl PenCanvas {
                     ops: wgpu::Operations {
                         // Always clear: a frame with zero staged meshes must
                         // not leave last frame's ink behind (deletions).
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: paper[0] as f64,
+                            g: paper[1] as f64,
+                            b: paper[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -252,6 +283,9 @@ impl PenCanvas {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(gm) = &grid {
+                self.renderer.draw(&mut pass, std::slice::from_ref(gm));
+            }
             for key in &staged {
                 if let Some(mesh) = self.cache.get(key) {
                     self.renderer.draw(&mut pass, std::slice::from_ref(mesh));

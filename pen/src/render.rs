@@ -70,6 +70,52 @@ pub struct StrokeMesh {
     pub index_count: u32,
 }
 
+/// Paper + grid colors (TOPS pad — must match the app's CSS theme).
+pub const PAPER: [f32; 4] = [0.847, 0.910, 0.816, 1.0];
+const GRID: [f32; 4] = [0.482, 0.682, 0.482, 0.4];
+const RULE: [f32; 4] = [0.118, 0.275, 0.125, 0.6];
+/// Grid unit + page-break interval, scene units (mirrors the app).
+pub const GRID_UNIT: f64 = 10.0;
+pub const SHEET_H: f64 = 1056.0;
+
+/// Background geometry for the visible rect: paper is the clear color
+/// (opaque — compositor alpha is unreliable across drivers, and an opaque
+/// canvas can never show black); grid + page rules are thin quads.
+pub fn grid_mesh(cam: &Camera) -> (Vec<Vertex>, Vec<u32>) {
+    let x0 = -cam.scroll_x - 4.0;
+    let y0 = -cam.scroll_y - 4.0;
+    let x1 = -cam.scroll_x + cam.view_w_px as f64 / cam.zoom + 4.0;
+    let y1 = -cam.scroll_y + cam.view_h_px as f64 / cam.zoom + 4.0;
+    let mut verts: Vec<Vertex> = Vec::new();
+    let mut idx: Vec<u32> = Vec::new();
+    let mut quad = |x0: f64, y0: f64, x1: f64, y1: f64, color: [f32; 4]| {
+        let base = verts.len() as u32;
+        verts.push(Vertex { pos: [x0 as f32, y0 as f32], color });
+        verts.push(Vertex { pos: [x1 as f32, y0 as f32], color });
+        verts.push(Vertex { pos: [x1 as f32, y1 as f32], color });
+        verts.push(Vertex { pos: [x0 as f32, y1 as f32], color });
+        idx.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    // Verticals + horizontals every GRID_UNIT.
+    let mut gx = (x0 / GRID_UNIT).floor() * GRID_UNIT;
+    while gx <= x1 {
+        quad(gx, y0, gx + 1.0, y1, GRID);
+        gx += GRID_UNIT;
+    }
+    let mut gy = (y0 / GRID_UNIT).floor() * GRID_UNIT;
+    while gy <= y1 {
+        quad(x0, gy, x1, gy + 1.0, GRID);
+        gy += GRID_UNIT;
+    }
+    // Page-break rules every SHEET_H, slightly heavier.
+    let mut ry = (y0 / SHEET_H).floor() * SHEET_H;
+    while ry <= y1 {
+        quad(x0, ry, x1, ry + 2.0, RULE);
+        ry += SHEET_H;
+    }
+    (verts, idx)
+}
+
 /// Renderer owns the pipeline + camera uniform; the embedder drives the
 /// render pass with its own surface texture.
 pub struct Renderer {
@@ -272,6 +318,29 @@ mod gpu_tests {
             view_formats: &[],
         });
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // Production order: paper grid first, ink over it. Buffers are
+        // built before the pass begins (the pass borrow outlives them).
+        let (gverts, gidx) = super::grid_mesh(&cam);
+        let grid: Option<super::StrokeMesh> = if gidx.is_empty() {
+            None
+        } else {
+            use wgpu::util::DeviceExt as _;
+            let gv = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test.grid-v"),
+                contents: bytemuck::cast_slice(&gverts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let gi = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test.grid-i"),
+                contents: bytemuck::cast_slice(&gidx),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            Some(super::StrokeMesh {
+                vertex_buf: gv,
+                index_buf: gi,
+                index_count: gidx.len() as u32,
+            })
+        };
         {
             let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let ms_view = ms_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -281,7 +350,12 @@ mod gpu_tests {
                     view: &ms_view,
                     resolve_target: Some(&out_view),
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: super::PAPER[0] as f64,
+                            g: super::PAPER[1] as f64,
+                            b: super::PAPER[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -291,6 +365,9 @@ mod gpu_tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(gm) = &grid {
+                renderer.draw(&mut pass, std::slice::from_ref(gm));
+            }
             renderer.draw(&mut pass, std::slice::from_ref(&stroke));
         }
         // Read back.
@@ -330,8 +407,32 @@ mod gpu_tests {
         let mid = px(32, 32);
         assert!(mid[3] > 200, "center should be opaque, got {mid:?}");
         assert!(mid[1] > mid[0] && mid[1] > mid[2], "greenish ink, got {mid:?}");
-        // Corner far from the stroke: transparent (paper shows through).
+        // Corner far from the stroke: opaque paper (opaque canvas —
+        // compositor alpha is unreliable, so paper lives in the frame).
         let corner = px(2, 60);
-        assert!(corner[3] < 40, "corner should be transparent, got {corner:?}");
+        assert!(corner[3] > 200, "corner should be opaque, got {corner:?}");
+        assert!(
+            corner[0] > 150 && corner[1] > 180 && corner[2] > 140,
+            "paper pale green, got {corner:?}"
+        );
+    }
+
+    #[test]
+    fn grid_mesh_covers_viewport() {
+        let cam = Camera { scroll_x: 80.0, scroll_y: -128.0, zoom: 1.31, view_w_px: 1280.0, view_h_px: 800.0 };
+        let (verts, idx) = grid_mesh(&cam);
+        assert!(!idx.is_empty());
+        assert_eq!(idx.len() % 3, 0);
+        let n = verts.len() as u32;
+        assert!(idx.iter().all(|&i| i < n));
+        // Bounds cover the visible rect (plus margin).
+        let [min_x, min_y, max_x, max_y] = Mesh {
+            vertices: verts.clone(),
+            indices: idx.clone(),
+        }
+        .bounds()
+        .expect("bounds");
+        assert!(min_x <= -80.0 && max_x >= -80.0 + 1280.0 / 1.31);
+        assert!(min_y <= 128.0 && max_y >= 128.0 + 800.0 / 1.31);
     }
 }
