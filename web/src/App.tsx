@@ -1920,7 +1920,7 @@ export default function App() {
         return (els as any[]).map((el) => {
           try {
             const m = meshProviderRef.current(el)
-            return m ? { id: el.id, verts: m.verts.length, idx: m.idx.length } : { id: el.id, skipped: true }
+            return m ? { id: el.id, verts: m.verts.length, idx: m.idx.length, v0: Array.from(m.verts.slice(0, 6)), i0: Array.from(m.idx.slice(0, 6)) } : { id: el.id, skipped: true }
           } catch (e) { return { id: el?.id, err: String(e).slice(0, 120) } }
         })
       },

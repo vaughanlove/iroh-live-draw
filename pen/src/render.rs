@@ -90,10 +90,22 @@ pub fn grid_mesh(cam: &Camera) -> (Vec<Vertex>, Vec<u32>) {
     let mut idx: Vec<u32> = Vec::new();
     let mut quad = |x0: f64, y0: f64, x1: f64, y1: f64, color: [f32; 4]| {
         let base = verts.len() as u32;
-        verts.push(Vertex { pos: [x0 as f32, y0 as f32], color });
-        verts.push(Vertex { pos: [x1 as f32, y0 as f32], color });
-        verts.push(Vertex { pos: [x1 as f32, y1 as f32], color });
-        verts.push(Vertex { pos: [x0 as f32, y1 as f32], color });
+        verts.push(Vertex {
+            pos: [x0 as f32, y0 as f32],
+            color,
+        });
+        verts.push(Vertex {
+            pos: [x1 as f32, y0 as f32],
+            color,
+        });
+        verts.push(Vertex {
+            pos: [x1 as f32, y1 as f32],
+            color,
+        });
+        verts.push(Vertex {
+            pos: [x0 as f32, y1 as f32],
+            color,
+        });
         idx.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     };
     // Verticals + horizontals every GRID_UNIT.
@@ -154,7 +166,10 @@ impl Renderer {
         let cam_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pen.camera-bind"),
             layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: cam_buf.as_entire_binding(),
+            }],
         });
         let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pen.pipe-layout"),
@@ -191,11 +206,18 @@ impl Renderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
-        Self { pipeline, cam_buf, cam_bind }
+        Self {
+            pipeline,
+            cam_buf,
+            cam_bind,
+        }
     }
 
     pub fn set_camera(&self, queue: &wgpu::Queue, cam: &Camera) {
@@ -216,7 +238,11 @@ impl Renderer {
             contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        Some(StrokeMesh { vertex_buf, index_buf, index_count: mesh.indices.len() as u32 })
+        Some(StrokeMesh {
+            vertex_buf,
+            index_buf,
+            index_count: mesh.indices.len() as u32,
+        })
     }
 
     /// Draw uploaded strokes into the embedder's pass. Clear color is the
@@ -237,7 +263,13 @@ mod tests {
     use super::*;
 
     fn cam() -> Camera {
-        Camera { scroll_x: 0.0, scroll_y: 0.0, zoom: 1.0, view_w_px: 200.0, view_h_px: 200.0 }
+        Camera {
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            zoom: 1.0,
+            view_w_px: 200.0,
+            view_h_px: 200.0,
+        }
     }
 
     #[test]
@@ -250,7 +282,13 @@ mod tests {
 
     #[test]
     fn uniforms_agree_with_project() {
-        let c = Camera { scroll_x: 80.0, scroll_y: -128.0, zoom: 1.31, view_w_px: 1280.0, view_h_px: 800.0 };
+        let c = Camera {
+            scroll_x: 80.0,
+            scroll_y: -128.0,
+            zoom: 1.31,
+            view_w_px: 1280.0,
+            view_h_px: 800.0,
+        };
         let u = c.uniforms();
         for (x, y) in [(0.0, 0.0), (400.0, 900.0), (-80.0, 128.0)] {
             let [px, py] = c.project(x, y);
@@ -269,8 +307,9 @@ mod gpu_tests {
 
     fn device() -> (wgpu::Device, wgpu::Queue) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-            .expect("no GPU adapter for render test");
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("no GPU adapter for render test");
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .expect("no GPU device for render test")
     }
@@ -282,16 +321,33 @@ mod gpu_tests {
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let samples = 4;
         let renderer = Renderer::new(&device, format, samples);
-        let cam = Camera { scroll_x: 0.0, scroll_y: 0.0, zoom: 1.0, view_w_px: w as f32, view_h_px: h as f32 };
+        let cam = Camera {
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            zoom: 1.0,
+            view_w_px: w as f32,
+            view_h_px: h as f32,
+        };
         renderer.set_camera(&queue, &cam);
 
         // Diagonal stroke corner to corner.
         let points: Vec<StrokePoint> = (0..=20)
-            .map(|i| StrokePoint::new(8.0 + i as f64 * 2.4, 8.0 + i as f64 * 2.4, 0.7, i as f64 * 8.0))
+            .map(|i| {
+                StrokePoint::new(
+                    8.0 + i as f64 * 2.4,
+                    8.0 + i as f64 * 2.4,
+                    0.7,
+                    i as f64 * 8.0,
+                )
+            })
             .collect();
         let mesh = crate::outline::build_mesh(&Stroke::new(
             points,
-            StrokeOptions { size: 8.0, monoline: true, ..StrokeOptions::default() },
+            StrokeOptions {
+                size: 8.0,
+                monoline: true,
+                ..StrokeOptions::default()
+            },
             [0.2, 0.5, 0.2, 1.0],
         ));
         assert!(!mesh.is_empty());
@@ -299,7 +355,11 @@ mod gpu_tests {
 
         let out_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test.out"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -309,7 +369,11 @@ mod gpu_tests {
         });
         let ms_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test.ms"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
@@ -393,11 +457,17 @@ mod gpu_tests {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit(std::iter::once(enc.finish()));
         readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
         let view = readback.get_mapped_range(..).expect("mapped");
         let px = |x: u32, y: u32| -> [u8; 4] {
             let o = (y * padded + x * 4) as usize;
@@ -406,7 +476,10 @@ mod gpu_tests {
         // On-stroke pixel (diagonal passes through center): inked + opaque.
         let mid = px(32, 32);
         assert!(mid[3] > 200, "center should be opaque, got {mid:?}");
-        assert!(mid[1] > mid[0] && mid[1] > mid[2], "greenish ink, got {mid:?}");
+        assert!(
+            mid[1] > mid[0] && mid[1] > mid[2],
+            "greenish ink, got {mid:?}"
+        );
         // Corner far from the stroke: opaque paper (opaque canvas —
         // compositor alpha is unreliable, so paper lives in the frame).
         let corner = px(2, 60);
@@ -419,7 +492,13 @@ mod gpu_tests {
 
     #[test]
     fn grid_mesh_covers_viewport() {
-        let cam = Camera { scroll_x: 80.0, scroll_y: -128.0, zoom: 1.31, view_w_px: 1280.0, view_h_px: 800.0 };
+        let cam = Camera {
+            scroll_x: 80.0,
+            scroll_y: -128.0,
+            zoom: 1.31,
+            view_w_px: 1280.0,
+            view_h_px: 800.0,
+        };
         let (verts, idx) = grid_mesh(&cam);
         assert!(!idx.is_empty());
         assert_eq!(idx.len() % 3, 0);

@@ -267,15 +267,28 @@ function startCpuLoop(
   let frames = 0
   let draws = 0
   let lastKey = ''
+  // Self-timing, split by phase. The tablet (no GPU) is where pan hurts,
+  // and USB debugging is unavailable there, so the loop measures itself and
+  // reports through stats() — readable on-device via the ?debug=1 drawer.
+  // prep = meshFor + frustum cull (our JS); draw = path build + raster
+  // (Canvas2D). Which one dominates decides the fix, so keep them apart.
+  let prepMs = 0
+  let drawMs = 0
+  let worstMs = 0
+  let visibleCount = 0
 
   const paintAll = (c: { scrollX: number; scrollY: number; zoom: number }) => {
     if (!g) return
+    const t0 = performance.now()
     // Scene → device px through the sheet transform.
     g.setTransform(
       dpr() * c.zoom, 0, 0, dpr() * c.zoom,
       dpr() * c.scrollX * c.zoom, dpr() * c.scrollY * c.zoom,
     )
     g.clearRect(-c.scrollX, -c.scrollY, canvas.width / dpr() / c.zoom, canvas.height / dpr() / c.zoom)
+    // Pass 1: resolve + cull into a flat worklist. Splitting this from the
+    // raster pass is what makes the two phases separately measurable.
+    const work: (typeof board.elements[number] & { m: any })[] = []
     for (const el of board.elements) {
       if (!el || el.isDeleted) continue
       let m: { verts: Float32Array; idx: Uint32Array; line: number[] | null; size: number; bounds: [number, number, number, number] } | null = null
@@ -285,6 +298,12 @@ function startCpuLoop(
         continue
       }
       if (!m || !visible(m.bounds, c)) continue
+      work.push({ ...el, m })
+    }
+    visibleCount = work.length
+    const t1 = performance.now()
+    // Pass 2: raster. Everything below is Canvas2D, not our JS.
+    for (const { m, ...el } of work) {
       // Prefer the centerline: one stroked path, zero triangle seams.
       if (m.line && m.line.length >= 4) {
         draws += 1
@@ -325,6 +344,11 @@ function startCpuLoop(
       g.fillStyle = `rgba(${r},${gg},${b},1)`
       g.fill()
     }
+    const t2 = performance.now()
+    prepMs = t1 - t0
+    drawMs = t2 - t1
+    const total = t2 - t0
+    if (total > worstMs) worstMs = total
   }
 
   const view = trackLoop(
@@ -347,7 +371,12 @@ function startCpuLoop(
   return {
     ...view,
     stats() {
-      return `cpu frames=${frames} drawn=${draws} | ferr=0`
+      return (
+        `cpu frames=${frames} drawn=${draws} vis=${visibleCount} | ferr=0` +
+        ` | prep=${prepMs.toFixed(2)}ms draw=${drawMs.toFixed(2)}ms` +
+        ` total=${(prepMs + drawMs).toFixed(2)}ms worst=${worstMs.toFixed(2)}ms` +
+        ` dpr=${dpr()}`
+      )
     },
   }
 }

@@ -25,6 +25,12 @@ run = "npm run dev"
 description = "Serve the production bundle (web/dist on :8080)"
 run = "cargo run --"
 
+[tasks.serve-fresh]
+description = "Rebuild pen-wasm + frontend, then serve production bundle (:8080)"
+run = """
+mise run pen-wasm && mise run build && cargo run --
+"""
+
 [tasks.wasm]
 description = "Rebuild browser wasm bindings into web/src/pkg (see README §Build)"
 run = """
@@ -54,7 +60,7 @@ run = "npm run build"
 #   mise run e2e --scenario keeper  # keeper-serves-while-owner-offline
 #   APP_URL=http://<lan-ip>:8080 RELAY_URL=<relay> mise run e2e --scenario rejoin
 [tasks.e2e]
-description = "Run a headless-browser scenario"
+description = "Run a headless-browser scenario (liveness|crdt|keeper|rejoin|live)"
 dir = "e2e"
 usage = '''
 flag "--scenario <name>" default="liveness" {
@@ -62,3 +68,16 @@ flag "--scenario <name>" default="liveness" {
 }
 '''
 run = "node spawn.mjs {{ usage.scenario }}"
+
+# E2E v2: device profiles (desktop/tablet/phone emulation) + assertion DSL.
+# Real assertions with exit codes — no log eyeballing.
+#   mise run e2e2 --scenario live
+[tasks.e2e2]
+description = "Run a DSL scenario (live) across emulated devices"
+dir = "e2e"
+usage = '''
+flag "--scenario <name>" default="live" {
+  choices "live"
+}
+'''
+run = "node harness.mjs {{ usage.scenario }}"

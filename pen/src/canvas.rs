@@ -14,6 +14,19 @@ pub struct Frame {
     frame: wgpu::SurfaceTexture,
 }
 
+/// Grid geometry for the visible rect, memoized across frames.
+///
+/// The grid is a pure function of the camera rect and viewport size, but
+/// `end_frame` ran it every frame — regenerating verts *and* allocating two
+/// fresh GPU buffers per frame. Pan/zoom/resize all change the rect, so the
+/// memo misses exactly when it matters most, and the miss cost scales with
+/// `view_w_px / zoom`: zooming out 10x built a 10x larger grid. Drawing
+/// never moves the camera, which is why it felt smooth while pan did not.
+struct GridCache {
+    key: (f64, f64, f64, u32, u32),
+    mesh: crate::render::StrokeMesh,
+}
+
 #[wasm_bindgen]
 pub struct PenCanvas {
     surface: wgpu::Surface<'static>,
@@ -27,6 +40,7 @@ pub struct PenCanvas {
     cache: std::collections::HashMap<String, crate::render::StrokeMesh>,
     staged: Vec<String>,
     cam: Camera,
+    grid_cache: Option<GridCache>,
     alpha_mode: wgpu::CompositeAlphaMode,
     caps: String,
     // Diagnostics (surfaced to the debug HUD): silent GPU death is the
@@ -47,7 +61,10 @@ impl PenCanvas {
         Self::new_with_fallback(canvas, false).await
     }
 
-    pub async fn new_with_fallback(canvas: HtmlCanvasElement, fallback: bool) -> Result<PenCanvas, JsValue> {
+    pub async fn new_with_fallback(
+        canvas: HtmlCanvasElement,
+        fallback: bool,
+    ) -> Result<PenCanvas, JsValue> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
@@ -75,10 +92,16 @@ impl PenCanvas {
         // Transparent clear over the CSS grid needs a compositing mode
         // that honors alpha; Auto negotiates opaque on several drivers
         // (opaque black canvas over the paper). Prefer pre-multiplied.
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+        let alpha_mode = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
             wgpu::CompositeAlphaMode::PreMultiplied
         } else {
-            caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto)
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
         };
         // SAFETY: surface outlives the canvas element it was created from;
         // the embedder must drop PenCanvas before removing the canvas.
@@ -95,7 +118,14 @@ impl PenCanvas {
             ms_view: None,
             cache: std::collections::HashMap::new(),
             staged: Vec::new(),
-            cam: Camera { scroll_x: 0.0, scroll_y: 0.0, zoom: 1.0, view_w_px: 1.0, view_h_px: 1.0 },
+            cam: Camera {
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                zoom: 1.0,
+                view_w_px: 1.0,
+                view_h_px: 1.0,
+            },
+            grid_cache: None,
             alpha_mode,
             caps: caps_str,
             begun: 0,
@@ -118,8 +148,17 @@ impl PenCanvas {
 
     /// Size the surface in device px (call on init + resize). Rebuilds the
     /// cached MSAA target alongside.
+    ///
+    /// Idempotent: a no-op resize returns immediately. Window `resize`
+    /// events arrive per-pixel during a drag, and each `surface.configure`
+    /// destroys the swapchain (realloc w*h*4 bytes per swap buffer) plus a
+    /// 4xMSAA realloc (w*h*16). Doing that per event drops a frame per
+    /// event; the early-out costs one integer compare instead.
     pub fn resize(&mut self, w_px: u32, h_px: u32) {
         let (w_px, h_px) = (w_px.max(1), h_px.max(1));
+        if self.cam.view_w_px == w_px as f32 && self.cam.view_h_px == h_px as f32 {
+            return;
+        }
         self.surface.configure(
             &self.device,
             &wgpu::SurfaceConfiguration {
@@ -141,7 +180,11 @@ impl PenCanvas {
         self.ms_view = if self.samples > 1 {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("pen.msaa"),
-                size: wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: w_px,
+                    height: h_px,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: self.samples,
                 dimension: wgpu::TextureDimension::D2,
@@ -160,9 +203,12 @@ impl PenCanvas {
         self.cam.scroll_y = scroll_y;
         self.cam.zoom = zoom;
         self.renderer.set_camera(&self.queue, &self.cam);
-        let encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             other => {
                 self.dropped += 1;
                 self.last_error = format!("acquire:{other:?}");
@@ -190,16 +236,20 @@ impl PenCanvas {
         if self.cache.contains_key(key) || verts.is_empty() || idx.is_empty() {
             return;
         }
-        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("pen.retain-v"),
-            contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("pen.retain-i"),
-            contents: bytemuck::cast_slice(idx),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vbuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pen.retain-v"),
+                contents: bytemuck::cast_slice(verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let ibuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pen.retain-i"),
+                contents: bytemuck::cast_slice(idx),
+                usage: wgpu::BufferUsages::INDEX,
+            });
         self.cache.insert(
             key.to_string(),
             crate::render::StrokeMesh {
@@ -253,34 +303,60 @@ impl PenCanvas {
     pub fn end_frame(&mut self) {
         // wgpu 30 presents on drop: submit work, then release the frame.
         // One pass: opaque paper clear, grid geometry, staged ink.
-        // Opaque throughout — compositor alpha proved unreliable across
-        // drivers (black canvas in production), so the paper lives in the
-        // frame instead of underneath it.
         let Some(fr) = self.frame.take() else { return };
         let staged = std::mem::take(&mut self.staged);
         use wgpu::util::DeviceExt as _;
         // Grid buffers precede the pass: the pass borrow outlives them.
-        let (gverts, gidx) = crate::render::grid_mesh(&self.cam);
-        let grid: Option<crate::render::StrokeMesh> = if gidx.is_empty() {
-            None
-        } else {
-            let gv = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pen.grid-v"),
-                contents: bytemuck::cast_slice(&gverts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let gi = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pen.grid-i"),
-                contents: bytemuck::cast_slice(&gidx),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            Some(crate::render::StrokeMesh {
-                vertex_buf: gv,
-                index_buf: gi,
-                index_count: gidx.len() as u32,
-            })
-        };
-        let view = fr.frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Memoized on the camera rect + viewport: an unchanged rect reuses
+        // the live buffers instead of rebuilding and re-uploading them.
+        // Hits are the common case (idle, and drawing — which never moves the
+        // camera), so those frames stop allocating two buffers each.
+        let grid_key = (
+            self.cam.scroll_x,
+            self.cam.scroll_y,
+            self.cam.zoom,
+            self.cam.view_w_px as u32,
+            self.cam.view_h_px as u32,
+        );
+        if !self.grid_cache.as_ref().is_some_and(|g| g.key == grid_key) {
+            // Explicit destroy before replacing: the wgpu allocator reuses
+            // freed ranges, whereas dropping defers release to GC time.
+            if let Some(old) = self.grid_cache.take() {
+                old.mesh.vertex_buf.destroy();
+                old.mesh.index_buf.destroy();
+            }
+            let (gverts, gidx) = crate::render::grid_mesh(&self.cam);
+            if !gidx.is_empty() {
+                let gv = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("pen.grid-v"),
+                        contents: bytemuck::cast_slice(&gverts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                let gi = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("pen.grid-i"),
+                        contents: bytemuck::cast_slice(&gidx),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                self.grid_cache = Some(GridCache {
+                    key: grid_key,
+                    mesh: crate::render::StrokeMesh {
+                        vertex_buf: gv,
+                        index_buf: gi,
+                        index_count: gidx.len() as u32,
+                    },
+                });
+            }
+        }
+        let grid: Option<&crate::render::StrokeMesh> =
+            self.grid_cache.as_ref().map(|g| &g.mesh);
+        let view = fr
+            .frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let (target, resolve) = match &self.ms_view {
             Some(ms) => (ms, Some(&view)),
             None => (&view, None),
@@ -311,7 +387,7 @@ impl PenCanvas {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(gm) = &grid {
+            if let Some(gm) = grid {
                 self.renderer.draw(&mut pass, std::slice::from_ref(gm));
             }
             for key in &staged {
@@ -324,4 +400,3 @@ impl PenCanvas {
         drop(fr.frame);
     }
 }
-

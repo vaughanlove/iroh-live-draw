@@ -110,6 +110,12 @@ export class PenCanvas {
     /**
      * Size the surface in device px (call on init + resize). Rebuilds the
      * cached MSAA target alongside.
+     *
+     * Idempotent: a no-op resize returns immediately. Window `resize`
+     * events arrive per-pixel during a drag, and each `surface.configure`
+     * destroys the swapchain (realloc w*h*4 bytes per swap buffer) plus a
+     * 4xMSAA realloc (w*h*16). Doing that per event drops a frame per
+     * event; the early-out costs one integer compare instead.
      * @param {number} w_px
      * @param {number} h_px
      */
@@ -1042,22 +1048,22 @@ function __wbg_get_imports() {
             arg0.writeBuffer(arg1, arg2, getArrayU8FromWasm0(arg3, arg4), arg5, arg6);
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 164, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 163, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true_);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 113, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 112, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true_);
             return ret;
         },
         __wbindgen_generic_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 113, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 112, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true__24);
             return ret;
         },
         __wbindgen_generic_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 113, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 112, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true__25);
             return ret;
         },
