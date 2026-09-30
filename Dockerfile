@@ -8,6 +8,7 @@ COPY src ./src
 COPY shared ./shared
 COPY browser-wasm ./browser-wasm
 COPY keeper ./keeper
+COPY pen ./pen
 RUN cargo build --release -p keeper
 
 FROM debian:bookworm-slim
