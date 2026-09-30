@@ -95,15 +95,28 @@ export default function PenOverlay({
     }
   }, [])
 
-  // Size the canvas once (fullscreen overlay; CSS px == scene transform base).
+  // Size the canvas (fullscreen overlay; CSS px == scene transform base).
+  // Re-sized on every window resize: a stale backing store stretches the
+  // preview (renders smaller + offset) while commits stay correct — the
+  // classic "disconnect between pen and render" on rotate/resize/URL-bar.
   useEffect(() => {
-    const c = canvasRef.current
-    if (!c) return
-    const dpr = Math.min(window.devicePixelRatio || 1, 3)
-    c.width = Math.floor(innerWidth * dpr)
-    c.height = Math.floor(innerHeight * dpr)
-    c.style.width = innerWidth + 'px'
-    c.style.height = innerHeight + 'px'
+    const fit = () => {
+      const c = canvasRef.current
+      if (!c) return
+      const dpr = Math.min(window.devicePixelRatio || 1, 3)
+      c.width = Math.floor(innerWidth * dpr)
+      c.height = Math.floor(innerHeight * dpr)
+      c.style.width = innerWidth + 'px'
+      c.style.height = innerHeight + 'px'
+      clearPreview()
+    }
+    fit()
+    window.addEventListener('resize', fit)
+    window.addEventListener('orientationchange', fit)
+    return () => {
+      window.removeEventListener('resize', fit)
+      window.removeEventListener('orientationchange', fit)
+    }
   }, [])
 
   const sceneOf = (clientX: number, clientY: number) => {
