@@ -184,6 +184,11 @@ function startGpuLoop(
   }
   // Idle skip: camera + rev unchanged → presenting again is pure cost.
   let lastFrameKey = ''
+  // Device-zoom handshake: the shader's view dims are device px (backing
+  // store), so zoom must arrive in device px too. Passing CSS zoom with
+  // device dims halves all rendering whenever dpr != 1 (smaller + offset
+  // ink on hidpi) — the CPU path never had this bug because setTransform
+  // takes dpr explicitly.
   const view = trackLoop(
     () => {
       board.setViewportSize(canvas.clientWidth, canvas.clientHeight)
@@ -205,7 +210,7 @@ function startGpuLoop(
         const key = `${c.scrollX}|${c.scrollY}|${c.zoom}|${board.rev}`
         if (key === lastFrameKey) return
         lastFrameKey = key
-        gpu.begin_frame(c.scrollX, c.scrollY, c.zoom)
+        gpu.begin_frame(c.scrollX, c.scrollY, c.zoom * dpr())
         const seen = new Set<string>()
         for (const el of board.elements) {
           if (!el || el.isDeleted) continue

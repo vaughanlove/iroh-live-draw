@@ -35,6 +35,7 @@ pub struct PenCanvas {
     dropped: u64,
     drawn: u64,
     last_error: String,
+    last_transfer: String,
 }
 
 #[wasm_bindgen]
@@ -101,13 +102,18 @@ impl PenCanvas {
             dropped: 0,
             drawn: 0,
             last_error: String::new(),
+            last_transfer: String::new(),
         })
     }
 
     /// "begun dropped drawn last_error" — polled by the debug HUD.
     /// Prefixed with surface caps (formats + alpha modes) for diagnosis.
+    /// Suffixed with the last transfer sample.
     pub fn stats(&self) -> String {
-        format!("{} | {} {} {} {}", self.caps, self.begun, self.dropped, self.drawn, self.last_error)
+        format!(
+            "{} | {} {} {} {} | tfr={}",
+            self.caps, self.begun, self.dropped, self.drawn, self.last_error, self.last_transfer
+        )
     }
 
     /// Size the surface in device px (call on init + resize). Rebuilds the
@@ -173,6 +179,14 @@ impl PenCanvas {
     /// This is the pan-smoothness fix: camera moves must never re-upload.
     pub fn retain_mesh(&mut self, key: &str, verts: &[f32], idx: &[u32]) {
         use wgpu::util::DeviceExt as _;
+        // TEMPORARY: sample received values for transfer diagnosis.
+        self.last_transfer = format!(
+            "n={} m={} v0={:?} i0={:?}",
+            verts.len(),
+            idx.len(),
+            &verts[..verts.len().min(6)],
+            &idx[..idx.len().min(6)]
+        );
         if self.cache.contains_key(key) || verts.is_empty() || idx.is_empty() {
             return;
         }
@@ -213,6 +227,20 @@ impl PenCanvas {
             mesh.vertex_buf.destroy();
             mesh.index_buf.destroy();
         }
+    }
+
+    /// TEMPORARY transfer probe: report what Rust actually received for a
+    /// key (count + first values). Remove with the red triangle.
+    pub fn probe_mesh(&self, key: &str) -> String {
+        match self.cache.get(key) {
+            None => "missing".to_string(),
+            Some(m) => format!("idx={}", m.index_count),
+        }
+    }
+
+    /// TEMPORARY: what the last retain_mesh call received (first values).
+    pub fn last_transfer(&self) -> String {
+        self.last_transfer.clone()
     }
 
     pub fn clear_cache(&mut self) {
