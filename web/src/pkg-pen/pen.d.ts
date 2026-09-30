@@ -19,6 +19,10 @@ export class PenCanvas {
      */
     evict(key: string): void;
     /**
+     * TEMPORARY: what the last retain_mesh call received (first values).
+     */
+    last_transfer(): string;
+    /**
      * Attach to an existing `<canvas>`. Async: adapter/device negotiation.
      * `fallback` forces the software adapter (SwiftShader): slower, but
      * works where the hardware adapter is blocklisted or absent.
@@ -26,8 +30,19 @@ export class PenCanvas {
     static new(canvas: HTMLCanvasElement): Promise<PenCanvas>;
     static new_with_fallback(canvas: HTMLCanvasElement, fallback: boolean): Promise<PenCanvas>;
     /**
+     * TEMPORARY transfer probe: report what Rust actually received for a
+     * key (count + first values). Remove with the red triangle.
+     */
+    probe_mesh(key: string): string;
+    /**
      * Size the surface in device px (call on init + resize). Rebuilds the
      * cached MSAA target alongside.
+     *
+     * Idempotent: a no-op resize returns immediately. Window `resize`
+     * events arrive per-pixel during a drag, and each `surface.configure`
+     * destroys the swapchain (realloc w*h*4 bytes per swap buffer) plus a
+     * 4xMSAA realloc (w*h*16). Doing that per event drops a frame per
+     * event; the early-out costs one integer compare instead.
      */
     resize(w_px: number, h_px: number): void;
     /**
@@ -39,6 +54,7 @@ export class PenCanvas {
     /**
      * "begun dropped drawn last_error" — polled by the debug HUD.
      * Prefixed with surface caps (formats + alpha modes) for diagnosis.
+     * Suffixed with the last transfer sample.
      */
     stats(): string;
 }

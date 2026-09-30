@@ -19,6 +19,10 @@ export class PenCanvas {
      */
     evict(key: string): void;
     /**
+     * TEMPORARY: what the last retain_mesh call received (first values).
+     */
+    last_transfer(): string;
+    /**
      * Attach to an existing `<canvas>`. Async: adapter/device negotiation.
      * `fallback` forces the software adapter (SwiftShader): slower, but
      * works where the hardware adapter is blocklisted or absent.
@@ -26,8 +30,19 @@ export class PenCanvas {
     static new(canvas: HTMLCanvasElement): Promise<PenCanvas>;
     static new_with_fallback(canvas: HTMLCanvasElement, fallback: boolean): Promise<PenCanvas>;
     /**
+     * TEMPORARY transfer probe: report what Rust actually received for a
+     * key (count + first values). Remove with the red triangle.
+     */
+    probe_mesh(key: string): string;
+    /**
      * Size the surface in device px (call on init + resize). Rebuilds the
      * cached MSAA target alongside.
+     *
+     * Idempotent: a no-op resize returns immediately. Window `resize`
+     * events arrive per-pixel during a drag, and each `surface.configure`
+     * destroys the swapchain (realloc w*h*4 bytes per swap buffer) plus a
+     * 4xMSAA realloc (w*h*16). Doing that per event drops a frame per
+     * event; the early-out costs one integer compare instead.
      */
     resize(w_px: number, h_px: number): void;
     /**
@@ -39,6 +54,7 @@ export class PenCanvas {
     /**
      * "begun dropped drawn last_error" — polled by the debug HUD.
      * Prefixed with surface caps (formats + alpha modes) for diagnosis.
+     * Suffixed with the last transfer sample.
      */
     stats(): string;
 }
@@ -99,8 +115,10 @@ export interface InitOutput {
     readonly pencanvas_draw_keyed: (a: number, b: number, c: number) => void;
     readonly pencanvas_end_frame: (a: number) => void;
     readonly pencanvas_evict: (a: number, b: number, c: number) => void;
+    readonly pencanvas_last_transfer: (a: number) => [number, number];
     readonly pencanvas_new: (a: any) => any;
     readonly pencanvas_new_with_fallback: (a: any, b: number) => any;
+    readonly pencanvas_probe_mesh: (a: number, b: number, c: number) => [number, number];
     readonly pencanvas_resize: (a: number, b: number, c: number) => void;
     readonly pencanvas_retain_mesh: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly pencanvas_stats: (a: number) => [number, number];
@@ -115,8 +133,8 @@ export interface InitOutput {
     readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___js_sys_6fff18a125d5dcf7___Function_fn_wasm_bindgen_e91fa3817bc4b7fa___JsValue_____wasm_bindgen_e91fa3817bc4b7fa___sys__Undefined___js_sys_6fff18a125d5dcf7___Function_fn_wasm_bindgen_e91fa3817bc4b7fa___JsValue_____wasm_bindgen_e91fa3817bc4b7fa___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true_: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true__22: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true__23: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true__24: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_e91fa3817bc4b7fa___convert__closures_____invoke___wasm_bindgen_e91fa3817bc4b7fa___sys__JsNullable_wgpu_5036807f9837e271___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_ed718c3d60ebd546___result__Result_____wasm_bindgen_e91fa3817bc4b7fa___JsError___true__25: (a: number, b: number, c: any) => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

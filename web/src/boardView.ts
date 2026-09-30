@@ -29,9 +29,44 @@ function hexToRgb(hex: string): [number, number, number, number] {  const h = (h
   return INK
 }
 
-function css(el: any): string {
-  const [r, g, b] = hexToRgb(el?.strokeColor)
+function css(el: any): string {  const [r, g, b] = hexToRgb(el?.strokeColor)
   return `rgba(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)},1)`
+}
+
+// On-screen perf readout for `?debug=1`. The slow device (Android tablet,
+// no GPU, no USB debugging) has no reachable console, so the numbers have
+// to land on the glass. Updates the text node directly — no innerHTML, no
+// per-frame element churn.
+function debugHud(): { set(t: string): void; destroy(): void } | null {
+  if (!/[?&]debug=1/.test(location.search)) return null
+  let el = document.getElementById('__perf_hud') as HTMLDivElement | null
+  if (!el) {
+    el = document.createElement('div')
+    el.id = '__perf_hud'
+    el.textContent = ''
+    Object.assign(el.style, {
+      position: 'fixed',
+      left: '8px',
+      bottom: '8px',
+      zIndex: '2147483647',
+      pointerEvents: 'none',
+      background: 'rgba(0,0,0,0.72)',
+      color: '#9f9',
+      font: '12px/1.5 monospace',
+      padding: '4px 8px',
+      borderRadius: '4px',
+      whiteSpace: 'pre',
+    } satisfies Partial<CSSStyleDeclaration>)
+    document.body.appendChild(el)
+  }
+  return {
+    set(t: string) {
+      if (el!.textContent !== t) el!.textContent = t
+    },
+    destroy() {
+      el?.remove()
+    },
+  }
 }
 
 export type BoardView = {
@@ -172,7 +207,7 @@ function startGpuLoop(
       }
       uploaded.add(key)
       uploadedById.set(id, key)
-      if (uploaded.size > 400) {
+      if (uploaded.size > 20000) {
         const first = uploaded.values().next().value as string | undefined
         if (first) {
           try { gpu.evict(first) } catch {}
@@ -267,15 +302,37 @@ function startCpuLoop(
   let frames = 0
   let draws = 0
   let lastKey = ''
+  // Self-timing, split by phase. The tablet (no GPU) is where pan hurts,
+  // and USB debugging is unavailable there, so the loop measures itself and
+  // reports through stats() — readable on-device via the ?debug=1 drawer.
+  // prep = meshFor + frustum cull (our JS); draw = path build + raster
+  // (Canvas2D). Which one dominates decides the fix, so keep them apart.
+  let prepMs = 0
+  let drawMs = 0
+  let worstMs = 0
+  let visibleCount = 0
+  // Color strings are pure functions of the element, but were rebuilt per
+  // stroke per frame (~500 template strings/frame). The trace showed 11
+  // major GCs and memory-pressure compaction on the tablet, so per-frame
+  // garbage is not a rounding error there. Keyed id + color so an edit to
+  // strokeColor re-derives instead of serving a stale string.
+  const colorCache = new Map<string, string>()
 
   const paintAll = (c: { scrollX: number; scrollY: number; zoom: number }) => {
     if (!g) return
+    const t0 = performance.now()
     // Scene → device px through the sheet transform.
     g.setTransform(
       dpr() * c.zoom, 0, 0, dpr() * c.zoom,
       dpr() * c.scrollX * c.zoom, dpr() * c.scrollY * c.zoom,
     )
     g.clearRect(-c.scrollX, -c.scrollY, canvas.width / dpr() / c.zoom, canvas.height / dpr() / c.zoom)
+    // Pass 1: resolve + cull into a flat worklist. Splitting this from the
+    // raster pass is what makes the two phases separately measurable.
+    // Parallel arrays, not object spreads: an earlier version built one
+    // object per visible element per frame, which is its own GC pressure.
+    const workEl: any[] = []
+    const workMesh: any[] = []
     for (const el of board.elements) {
       if (!el || el.isDeleted) continue
       let m: { verts: Float32Array; idx: Uint32Array; line: number[] | null; size: number; bounds: [number, number, number, number] } | null = null
@@ -285,10 +342,26 @@ function startCpuLoop(
         continue
       }
       if (!m || !visible(m.bounds, c)) continue
+      workEl.push(el)
+      workMesh.push(m)
+    }
+    visibleCount = workMesh.length
+    const t1 = performance.now()
+    // Pass 2: raster. Everything below is Canvas2D, not our JS.
+    for (let wi = 0; wi < workMesh.length; wi++) {
+      const el = workEl[wi]
+      const m = workMesh[wi]
+      const ckey = el.id + '|' + (el.strokeColor ?? '')
+      let color = colorCache.get(ckey)
+      if (color === undefined) {
+        color = css(el)
+        if (colorCache.size > 2000) colorCache.clear()
+        colorCache.set(ckey, color)
+      }
       // Prefer the centerline: one stroked path, zero triangle seams.
       if (m.line && m.line.length >= 4) {
         draws += 1
-        g.strokeStyle = css(el)
+        g.strokeStyle = color
         g.lineWidth = m.size
         g.lineCap = 'round'
         g.lineJoin = 'round'
@@ -300,7 +373,7 @@ function startCpuLoop(
       }
       if (m.line && m.line.length === 2) {
         draws += 1
-        g.fillStyle = css(el)
+        g.fillStyle = color
         g.beginPath()
         g.arc(m.line[0], m.line[1], m.size / 2, 0, Math.PI * 2)
         g.fill()
@@ -325,8 +398,23 @@ function startCpuLoop(
       g.fillStyle = `rgba(${r},${gg},${b},1)`
       g.fill()
     }
+    const t2 = performance.now()
+    prepMs = t1 - t0
+    drawMs = t2 - t1
+    const total = t2 - t0
+    if (total > worstMs) worstMs = total
   }
 
+  const hud = debugHud()
+  const paint = (c: { scrollX: number; scrollY: number; zoom: number }) => {
+    paintAll(c)
+    if (hud) {
+      hud.set(
+        `prep ${prepMs.toFixed(2)}ms  draw ${drawMs.toFixed(2)}ms  ` +
+          `worst ${worstMs.toFixed(2)}ms  vis ${visibleCount}  dpr ${dpr()}`,
+      )
+    }
+  }
   const view = trackLoop(
     () => {
       board.setViewportSize(canvas.clientWidth, canvas.clientHeight)
@@ -341,13 +429,22 @@ function startCpuLoop(
       if (key === lastKey) return
       lastKey = key
       frames += 1
-      paintAll(c)
+      paint(c)
     },
   )
   return {
     ...view,
+    destroy() {
+      hud?.destroy()
+      view.destroy()
+    },
     stats() {
-      return `cpu frames=${frames} drawn=${draws} | ferr=0`
+      return (
+        `cpu frames=${frames} drawn=${draws} vis=${visibleCount} | ferr=0` +
+        ` | prep=${prepMs.toFixed(2)}ms draw=${drawMs.toFixed(2)}ms` +
+        ` total=${(prepMs + drawMs).toFixed(2)}ms worst=${worstMs.toFixed(2)}ms` +
+        ` dpr=${dpr()}`
+      )
     },
   }
 }
@@ -359,14 +456,22 @@ function startCpuLoop(
 // seams can never appear at overlaps.
 export function makeMeshProvider() {
   const cache = new Map<string, Cached>()
+  // Previous version of each element, so a re-version evicts in O(1) via
+  // `prev` instead of scanning every key for an `id:` prefix match. That
+  // scan was O(cache) per miss; at 500 strokes against the old 400-entry
+  // cap it thrashed every frame — hundreds of thousands of prefix-string
+  // allocations per frame, which is what the tablet trace's major GCs and
+  // the 170ms prep phase were.
+  const prevKey = new Map<string, string>()
   const meshFor: MeshFor = (el: any) => {
     if (!el || el.isDeleted || el.type !== 'freedraw' || !Array.isArray(el.points)) return null
     const key = `${el.id}:${el.version}`
     const hit = cache.get(key)
     if (hit) return hit
-    // Evict stale versions of the same element (bounded: latest only).
-    for (const k of cache.keys()) {
-      if (k.startsWith(el.id + ':') && k !== key) cache.delete(k)
+    const stale = prevKey.get(el.id)
+    if (stale !== undefined) {
+      cache.delete(stale)
+      prevKey.delete(el.id)
     }
     try {
       const [r, g, b, a] = hexToRgb(el?.strokeColor)
@@ -393,9 +498,17 @@ export function makeMeshProvider() {
       }
       s.free()
       cache.set(key, out)
-      if (cache.size > 400) {
+      prevKey.set(el.id, key)
+      // Generous enough to hold a full board: the working set for a pan is
+      // every stroke, and a cap below that converts into thrash rather than
+      // bounding memory. Bounds are evicted by re-version, not by size.
+      if (cache.size > 20000) {
         const first = cache.keys().next().value
-        if (first) cache.delete(first)
+        if (first) {
+          cache.delete(first)
+          const id = first.slice(0, first.lastIndexOf(':'))
+          if (prevKey.get(id) === first) prevKey.delete(id)
+        }
       }
       return out
     } catch {
