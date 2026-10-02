@@ -2247,6 +2247,9 @@ export default function App() {
   // EPHEMERAL cursor broadcast: throttled pointer position over the mesh.
   // Best-effort datagram semantics — drops are fine, the next move replaces
   // them. Never persisted, never merged, never sent to the cell.
+  // Window-level (capture): the pen overlay swallows canvas pointer events
+  // while armed, so a canvas handler only fires for pan/eraser. Presence
+  // must not depend on the active tool.
   const cursorLastRef = useRef(0)
   const sendCursor = (clientX: number, clientY: number) => {
     try {
@@ -2266,9 +2269,13 @@ export default function App() {
       })
     } catch {}
   }
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => sendCursor(e.clientX, e.clientY)
+    window.addEventListener('pointermove', onMove, { capture: true, passive: true })
+    return () => window.removeEventListener('pointermove', onMove, { capture: true } as any)
+  }, [])
 
   const onCanvasPointerMove = (e: React.PointerEvent) => {
-    sendCursor(e.clientX, e.clientY)
     if (pointersRef.current.has(e.pointerId)) {
       pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     }
