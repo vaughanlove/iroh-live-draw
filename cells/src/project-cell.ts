@@ -29,6 +29,7 @@ const wasmMerge = (s: any, push: any): any | null => {
     const inPtr = crdt.crdt_alloc(input.length);
     new Uint8Array(crdt.memory.buffer).set(input, inPtr);
     const packed = crdt.crdt_merge(inPtr, input.length);
+    crdt.crdt_free(inPtr, input.length);
     // packed = out_ptr | (out_len << 32); BigInt when i64 is involved.
     const p = typeof packed === 'bigint' ? packed : BigInt(packed as any);
     const outPtr = Number(p & 0xffffffffn);

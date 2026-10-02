@@ -281,19 +281,20 @@ mod wasm_abi {
 
     #[no_mangle]
     pub extern "C" fn crdt_alloc(len: usize) -> *mut u8 {
-        let mut buf = Vec::<u8>::with_capacity(len);
-        let ptr = buf.as_mut_ptr();
-        std::mem::forget(buf);
-        ptr
+        // Boxed slice: len == capacity exactly, so crdt_free round-trips.
+        let boxed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
+        Box::leak(boxed).as_mut_ptr()
     }
 
     #[no_mangle]
     pub extern "C" fn crdt_free(ptr: *mut u8, len: usize) {
-        if ptr.is_null() || len == 0 {
+        if ptr.is_null() {
             return;
         }
         unsafe {
-            let _ = Vec::from_raw_parts(ptr, len, len);
+            // Inverse of emit: reconstruct the exact boxed slice.
+            let slice = std::slice::from_raw_parts_mut(ptr, len);
+            let _ = Box::from_raw(slice as *mut [u8]);
         }
     }
 
@@ -317,8 +318,9 @@ mod wasm_abi {
     }
 
     fn emit(out: Vec<u8>) -> u64 {
-        let len = out.len() as u64;
-        let ptr = out.leak().as_ptr() as u64;
+        let boxed: Box<[u8]> = out.into_boxed_slice();
+        let len = boxed.len() as u64;
+        let ptr = Box::leak(boxed).as_mut_ptr() as u64;
         ptr | (len << 32)
     }
 }
