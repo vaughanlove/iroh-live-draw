@@ -19,6 +19,7 @@ import {
   selfTest,
 } from './crypto.js'
 import { cellPush, cellSnapshot, cellSubscribe } from './cell.js'
+import { attachPeerOverlay } from './peers.js'
 
 async function copyText(t: string) {
   try {
@@ -970,6 +971,17 @@ export default function App() {
     } catch (e) { setStatus(`firewall failed: ${e}`) }
   }
 
+  // ---- Sync split: DURABLE vs EPHEMERAL ---------------------------------
+  // DURABLE (must survive a dead node): elements + claims + tombstones +
+  // files. Two writers: gossip 'p'/'snap' (live peers, merge-only) and the
+  // cell (debounced push, snapshot fetch, WS fan-out). Both carry the same
+  // sealed envelopes + cleartext claims; the Rust draw-crdt merge is the
+  // single judge of what wins.
+  // EPHEMERAL (latest-wins, loss is fine): cursor positions, presence.
+  // Mesh-only ('cursor' gossip, set_current_doc presence), rendered from
+  // board.peers on a separate overlay canvas. These MUST NOT enter rev,
+  // onChange, localStorage snapshots, or cell pushes — durability gating
+  // on throwaway data is pure latency tax.
   const sendMsg = (obj: any) => {
     const ch = activeCh()
     if (!ch) return
@@ -1829,18 +1841,22 @@ export default function App() {
     setStatus('new project created — share link copied')
   }
 
+  // EPHEMERAL presence → render-only peers. Cursor dots ride the mesh and
+  // land in board.peers (overlay canvas); they never enter rev, onChange,
+  // snapshots, or the cell. Stale entries (>3s) are pruned at write + paint.
   const pushCollaborators = () => {
-    const a = apiRef.current
-    if (!a) return
-    const map = new Map()
+    const board = boardRef.current
+    if (!board) return
+    const peers: Record<string, { x: number; y: number; nick: string; at: number }> = {}
     for (const [from, c] of Object.entries(cursors.current)) {
-      map.set(from, {
-        pointer: { x: c.x, y: c.y, tool: 'pointer' },
-        button: 'up',
-        username: dispNick(from, onlineRef.current[from] ?? peersRef.current[from]?.nick ?? from.slice(0, 6)),
-      })
+      peers[from] = {
+        x: c.x,
+        y: c.y,
+        nick: dispNick(from, onlineRef.current[from] ?? peersRef.current[from]?.nick ?? from.slice(0, 6)),
+        at: c.at,
+      }
     }
-    a.updateScene({ collaborators: map as any })
+    board.setPeers(peers)
   }
 
   // boot: stable identity, then room from share link if present
@@ -2288,7 +2304,31 @@ export default function App() {
     }
   }
 
+  // EPHEMERAL cursor broadcast: throttled pointer position over the mesh.
+  // Best-effort datagram semantics — drops are fine, the next move replaces
+  // them. Never persisted, never merged, never sent to the cell.
+  const cursorLastRef = useRef(0)
+  const sendCursor = (clientX: number, clientY: number) => {
+    try {
+      const now = Date.now()
+      if (now - cursorLastRef.current < 100) return
+      cursorLastRef.current = now
+      const board = boardRef.current
+      const canvas = canvasRef.current
+      if (!board || !canvas || !activeCh()) return
+      const r = canvas.getBoundingClientRect()
+      const c = board.camera
+      sendMsg({
+        t: 'cursor',
+        x: (clientX - r.left) / c.zoom - c.scrollX,
+        y: (clientY - r.top) / c.zoom - c.scrollY,
+        page: activePageRef.current ?? 'main',
+      })
+    } catch {}
+  }
+
   const onCanvasPointerMove = (e: React.PointerEvent) => {
+    sendCursor(e.clientX, e.clientY)
     if (pointersRef.current.has(e.pointerId)) {
       pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     }
@@ -2381,12 +2421,17 @@ export default function App() {
   useEffect(() => {
     let dead = false
     let view: { destroy(): void; stats(): string; renderer: string } | null = null
+    let peers: { destroy(): void } | null = null
     ;(async () => {
       const canvas = canvasRef.current
       const board = boardRef.current
       if (!canvas || !board) return
       board.onChange = stableOnChange
       board.setViewportSize(canvas.clientWidth, canvas.clientHeight)
+      // Ephemeral overlay first: own canvas + loop, zero coupling to ink.
+      try {
+        if (canvas.parentElement) peers = attachPeerOverlay(canvas.parentElement, canvas, board)
+      } catch {}
       try {
         view = await createBoardView(canvas, board, meshProviderRef.current)
       } catch (err) {
@@ -2400,6 +2445,7 @@ export default function App() {
     return () => {
       dead = true
       view?.destroy()
+      peers?.destroy()
       if (viewRef.current === view) viewRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
