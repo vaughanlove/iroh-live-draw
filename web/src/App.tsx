@@ -189,39 +189,13 @@ const saveHighlights = (docId: string, h: Highlight[]) => {
 const DEBUG =
   (import.meta as any).env?.VITE_DEBUG === '1' ||
   new URLSearchParams(location.search).has('debug')
-// Custom relay (all mesh traffic) + keeper (always-on watch peer).
-// Empty = n0 defaults / no keeper. Both also accept `?relay=` / `?keeper=`
-// query overrides (handy for tests and for pointing a build at private infra
-// without rebuilding).
+// Mesh relay (ephemeral gossip: strokes-in-flight, cursors, presence).
+// Client-side iroh through the Railway relay; the mesh never touches
+// Cloudflare and holds nothing durable. `?relay=` overrides per-boot.
 const qs = new URLSearchParams(location.search)
 const RELAY_URL = (qs.get('relay') ?? (import.meta as any).env?.VITE_RELAY_URL ?? '').trim() || undefined
-const KEEPER_URL = (qs.get('keeper') ?? (import.meta as any).env?.VITE_KEEPER_URL ?? '').trim().replace(/\/$/, '') || undefined
-const KEEPER_TOKEN = (
-  (import.meta as any).env?.VITE_KEEPER_TOKEN ??
-  (import.meta as any).env?.VITE_KEEPER_SECRET ??
-  ''
-).trim() || undefined
-
-// Register a doc's ticket with the keeper so it joins as a watch peer.
-// Fire-and-forget: keeper down just means no cache until it's back.
-// The keeper's endpoint id comes back in the response and is stored for
-// direct snapshot fetches (no gossip mesh needed for those).
-const LS_KEEPER = 'draw.keeper'
-const registerWithKeeper = (ticket: string) => {
-  if (!KEEPER_URL || !ticket) return
-  try {
-    fetch(`${KEEPER_URL}/watch`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(KEEPER_TOKEN ? { 'x-keeper-token': KEEPER_TOKEN } : {}),
-      },
-      body: JSON.stringify({ ticket }),
-    }).then((r) => r.json()).then((j) => {
-      if (j?.keeper) { try { localStorage.setItem(LS_KEEPER, String(j.keeper)) } catch {} }
-    }).catch(() => {})
-  } catch {}
-}
+// NOTE: VITE_KEEPER_URL / ?keeper= now address the celld fleet (durable
+// truth); see cell.ts. The keeper watch peer is retired.
 
 import { useState as useRolodexState, useRef as useRolodexRef } from 'react'
 
@@ -832,16 +806,15 @@ export default function App() {
 
   // Snapshots can vanish into a half-built mesh (late-joiner broadcast
   // stall): if our scene is still empty seconds after requesting, ask
-  // again. Last resort is a direct QUIC fetch from the keeper, which needs
-  // no gossip mesh at all. All bounded — each step fires only if we're
-  // still on the same doc+page with an empty canvas.
+  // again. The cell snapshot needs no mesh at all. All bounded — each step
+  // fires only if we're still on the same doc+page with an empty canvas.
   const fetchFromKeeper = async (roomId: string, page: string, force = false): Promise<boolean> => {
     try {
       if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return false
       if (!force && (apiRef.current?.getSceneElements() ?? []).length > 0) return false
-      // Cell first (no iroh needed): plain HTTPS snapshot from the celld
-      // fleet. Same envelope/claims wire format as the keeper path, so the
-      // ingest below is shared. Falls through to gossip/QUIC on failure.
+      // Cell (no iroh needed): plain HTTPS snapshot from the celld fleet.
+      // Same envelope/claims wire format as gossip, so the ingest below is
+      // shared. Falls through to gossip snap-req retries on failure.
       try {
         const snap = await cellSnapshot(roomId, page)
         if (snap && (snap.elements.length || snap.tombs.length)) {
@@ -863,38 +836,10 @@ export default function App() {
           return true
         }
       } catch {}
-      // NOTE: deliberately no api guard — queueRemote holds the data and
-      // flushPending waits for mount. Requiring api here drops rejoins
-      // whose fetch beats Excalidraw's mount.
-      const node = nodeRef.current
-      const keeperId = localStorage.getItem(LS_KEEPER)
-      const ticket = docsRef.current.find((d) => d.id === roomId)?.ticket
-      // Keeper shares our relay setup in every deployment that matters, so
-      // our own home relay is a sound fallback when none is configured.
-      const relay = RELAY_URL ?? node?.relay_url?.()
-      if (!node?.fetch_snapshot || !keeperId || !relay || !ticket) {
-        lastFetch.current = `skipped:${!node?.fetch_snapshot ? ' nofn' : ''}${!keeperId ? ' noid' : ''}${!relay ? ' norelay' : ''}${!ticket ? ' noticket' : ''}`
-        return false
-      }
-      const json = await node.fetch_snapshot(keeperId, relay, ticket, page)
-      if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
-      const res = JSON.parse(json)
-      lastFetch.current = `els=${res.elements?.length ?? '?'} tombs=${res.tombs?.length ?? '?'}`
-      const files = await openIncomingFiles(roomId, res.files)
-      if (files.length) ingestFiles(files)
-      const els = await openEls(roomId, Array.isArray(res.elements) ? res.elements : [])
-      const tombs = Array.isArray(res.tombs) ? res.tombs : []
-      if (!els.length && !tombs.length) return false
-      remote.current = true
-      try {
-        if (ingestTombs(tombs)) { /* enforced below */ }
-        if (els.length) queueRemote(els, res.meta, false)
-        enforceTombs()
-      } finally {
-        remote.current = false
-      }
-      setStatus('restored from keeper')
-      return true
+      // Cell missed (or no cell configured): fall through to gossip
+      // snap-req retries. The keeper QUIC path is retired — the mesh holds
+      // nothing durable, the cell holds everything.
+      return false
     } catch (e) {
       fetchErr.current = String(e).slice(0, 160)
       return false
@@ -908,17 +853,16 @@ export default function App() {
       window.setTimeout(() => requestSnap(roomId, page, 1), 6000)
       return
     }
-    // Gossip retries didn't fill us: go direct to the keeper, which needs
-    // no mesh at all. Keep trying a few times — relay settle, keeper id
-    // arrival, and api mount all race boot.
+    // Gossip retries didn't fill us: go to the cell, which needs no mesh
+    // at all. Keep trying a few times — cell deploy, api mount all race boot.
     fetchFromKeeper(roomId, page, true).then((ok) => {
       if (!ok && attempt < 4) window.setTimeout(() => requestSnap(roomId, page, attempt + 1), 8000)
     })
   }
 
-  // Keeper pull independent of scene emptiness: merge-only, so it can run
+  // Cell pull independent of scene emptiness: merge-only, so it can run
   // on every join even with a stale-but-nonempty canvas. Retries until it
-  // goes through (relay/keeper-id/api all race boot).
+  // goes through.
   const requestKeeper = (roomId: string, page: string, attempt = 0) => {
     if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
     if (attempt > 4) return
@@ -1712,16 +1656,13 @@ export default function App() {
     setStatus('connected — draw!')
     refreshOwnerLive()
     requestSnap(roomId, pg)
-    // Every join pulls the keeper's latest for this page and merges it —
+    // Every join pulls the cell's latest for this page and merges it —
     // reconnect, room switch, and refresh are all the same event: someone
     // joining a stream. Merge (never replace) so unsynced local edits
-    // survive alongside the keeper's truth. Keeper pull runs regardless of
+    // survive alongside the cell's truth. Cell pull runs regardless of
     // scene emptiness (unlike the gossip snap path above).
     requestKeeper(roomId, pg, 0)
     window.setTimeout(() => healFromSnapshot(roomId, pg), 4000)
-    // The selected document wakes the keeper.
-    const sel = docsRef.current.find((d) => d.id === roomId)
-    if (sel?.ticket) registerWithKeeper(sel.ticket)
   }
 
   const switchPage = (pageId: string) => {
@@ -1809,7 +1750,6 @@ export default function App() {
     else docs.push(entry)
     setDocsBoth(docs)
     try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
-    registerWithKeeper(ticketStr)
     return roomId
   }
 
