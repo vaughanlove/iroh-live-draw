@@ -4,6 +4,5 @@
   "compatibility_date": "2026-08-01",
   "durable_objects": {
     "bindings": [{ "name": "PROJECT", "class_name": "ProjectCell" }]
-  },
-  "migrations": [{ "tag": "v1", "new_classes": ["ProjectCell"] }]
+  }
 }
