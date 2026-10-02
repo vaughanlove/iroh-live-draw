@@ -89,17 +89,19 @@ export class ProjectCell {
   }
 
   async load(page: string) {
-    const [els, meta, tombs, files] = await Promise.all([
+    const [els, meta, tombs, files, pages] = await Promise.all([
       this.state.storage.get(`els:${page}`) as any,
       this.state.storage.get(`meta:${page}`) as any,
       this.state.storage.get(`tombs:${page}`) as any,
       this.state.storage.get(`files:${page}`) as any,
+      this.state.storage.get('pages') as any,
     ]);
     return {
       elements: els ?? {},
       meta: meta ?? {},
       tombs: tombs ?? {},
       files: files ?? {},
+      pages: pages ?? {},
     };
   }
 
@@ -109,23 +111,50 @@ export class ProjectCell {
       this.state.storage.put(`meta:${page}`, s.meta),
       this.state.storage.put(`tombs:${page}`, s.tombs),
       this.state.storage.put(`files:${page}`, s.files),
+      this.state.storage.put('pages', s.pages),
     ]);
   }
 
   // Merge a push: envelopes in, merged snapshot out. Same rules as keeper
   // ingest_elements/ingest_tombs + evict: tomb-condemned elements stay dead.
   // Rust wasm first (single source of truth), JS mirror as fallback.
+  // Page roster union lives here (path-independent): the wasm core only
+  // judges element claims.
   merge(s: any, push: any) {
     const files = Array.isArray(push.files)
       ? Object.fromEntries(push.files.filter((f: any) => f?.id).map((f: any) => [f.id, f]))
       : (push.files ?? {});
     const norm = { ...push, files };
     const w = wasmMerge(s, norm);
-    if (w) {
+    const merged = w
       // wasm returns map-shaped state; convert files back to cell shape.
-      return { elements: w.elements, meta: w.meta, tombs: w.tombs, files: w.files };
+      ? { elements: w.elements, meta: w.meta, tombs: w.tombs, files: w.files, pages: s.pages ?? {} }
+      : this.mergeJs(s, norm);
+    this.touchPages(merged, norm);
+    return merged;
+  }
+
+  touchPages(s: any, push: any) {
+    s.pages = s.pages ?? {};
+    for (const p of push.pages ?? []) {
+      if (!p?.id) continue;
+      const prev = s.pages[p.id] ?? {};
+      s.pages[p.id] = {
+        id: p.id,
+        name: typeof p.name === 'string' ? p.name : (prev.name ?? p.id),
+        createdAt: p.createdAt ?? prev.createdAt ?? Date.now(),
+        updatedAt: Math.max(p.updatedAt ?? 0, prev.updatedAt ?? 0, Date.now()),
+      };
     }
-    return this.mergeJs(s, norm);
+    if (push.pageId) {
+      const prev = s.pages[push.pageId] ?? {};
+      s.pages[push.pageId] = {
+        id: push.pageId,
+        name: push.pageName ?? prev.name ?? push.pageId,
+        createdAt: prev.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+      };
+    }
   }
 
   mergeJs(s: any, push: any) {
@@ -176,6 +205,9 @@ export class ProjectCell {
       meta: s.meta,
       tombs: Object.entries(s.tombs).map(([id, c]: any) => ({ id, ...c })),
       files: Object.values(s.files),
+      // Project page roster: lets late joiners discover boards without
+      // gossip history (the 'pages' broadcast has no replay).
+      pages: Object.values(s.pages ?? {}),
     };
   }
 
@@ -200,6 +232,7 @@ export class ProjectCell {
     }
     if (url.pathname === '/push' && req.method === 'POST') {
       const push = await req.json();
+      push.pageId = page;
       const s = this.merge(await this.load(page), push);
       await this.save(page, s);
       const snap = this.snapshot(s);

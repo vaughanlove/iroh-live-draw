@@ -829,13 +829,21 @@ export default function App() {
       // shared. Falls through to gossip snap-req retries on failure.
       try {
         const snap = await cellSnapshot(roomId, page)
-        if (snap && (snap.elements.length || snap.tombs.length)) {
+        if (snap && (snap.elements.length || snap.tombs.length || (snap.pages?.length ?? 0))) {
           if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return false
           lastFetch.current = `cell els=${snap.elements.length} tombs=${snap.tombs.length}`
+          // Adopt boards we never heard about over gossip (late join on an
+          // old board while viewing 'main'). Roster lives in the cell now.
+          if (Array.isArray(snap.pages) && snap.pages.length) mergePages(roomId, snap.pages)
           const files = await openIncomingFiles(roomId, snap.files)
           if (files.length) ingestFiles(files)
           const els = await openEls(roomId, snap.elements)
-          if (!els.length && !snap.tombs.length) return false
+          if (!els.length && !snap.tombs.length) {
+            // Nothing for this page, but the roster may name the live board:
+            // follow it (once per doc) instead of camping on empty 'main'.
+            followLiveBoard(roomId)
+            return false
+          }
           remote.current = true
           try {
             if (ingestTombs(snap.tombs)) { /* enforced below */ }
@@ -1516,7 +1524,15 @@ export default function App() {
       const sfiles = await sealOutgoingFiles(roomId, g.files)
       const fmap: Record<string, any> = {}
       for (const f of sfiles) if (f?.id) fmap[f.id] = f
-      cellPush(roomId, pg, { elements: sels, meta: g.meta, tombs: g.tombs, files: fmap })
+      const doc = docsRef.current.find((d) => d.id === roomId)
+      cellPush(roomId, pg, {
+        elements: sels,
+        meta: g.meta,
+        tombs: g.tombs,
+        files: fmap,
+        pages: (doc?.pages ?? []).map((p) => ({ id: p.id, name: p.name, createdAt: p.createdAt, updatedAt: p.updatedAt })),
+        pageName: doc?.pages?.find((p) => p.id === pg)?.name ?? pg,
+      })
     } catch {}
   }
   const scheduleCellPush = (roomId: string, pg: string) => {
@@ -1626,6 +1642,28 @@ export default function App() {
   const broadcastPages = () => {
     const doc = docsRef.current.find((d) => d.id === activeRef.current)
     if (doc) sendMsg({ t: 'pages', pages: doc.pages })
+  }
+
+  // Late-join follow: our page is empty but the adopted roster names other
+  // boards (old board, we landed on 'main'). Jump once per doc to the most
+  // recently touched board instead of showing an empty canvas. The switch
+  // itself triggers a snapshot fetch for that page, so this terminates.
+  const followedRef = useRef(new Set<string>())
+  const followLiveBoard = (roomId: string) => {
+    try {
+      if (followedRef.current.has(roomId)) return
+      if ((apiRef.current?.getSceneElements() ?? []).length > 0) return
+      const pg = activePageRef.current ?? 'main'
+      const raw = localStorage.getItem(snapKey(roomId, pg))
+      if (raw && raw !== '[]') return
+      const doc = docsRef.current.find((d) => d.id === roomId)
+      const others = (doc?.pages ?? []).filter((p) => p.id !== pg)
+      if (!others.length) return
+      followedRef.current.add(roomId)
+      others.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      setStatus(`following live board ${others[0].name}`)
+      switchPage(others[0].id)
+    } catch {}
   }
 
   const switchDoc = (roomId: string) => {
@@ -1900,6 +1938,7 @@ export default function App() {
       if (roomId !== activeRef.current) return
       void (async () => {
         try {
+          if (Array.isArray(snap.pages) && snap.pages.length) mergePages(roomId, snap.pages)
           const els = await openEls(roomId, snap.elements)
           const files = await openIncomingFiles(roomId, snap.files)
           if (pg === (activePageRef.current ?? 'main')) {

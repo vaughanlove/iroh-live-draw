@@ -21,11 +21,15 @@ const base = (): string | undefined => {
 
 export const cellBase = base;
 
+export type CellPage = { id: string; name: string; createdAt: number; updatedAt: number };
+
 export type CellPush = {
   elements: any[];
   meta: Record<string, [number, string]>;
   tombs: { id: string; v: number; ts: number; author: string }[];
   files: Record<string, any>;
+  pages: CellPage[];
+  pageName: string;
 };
 
 export type CellSnapshot = {
@@ -33,6 +37,7 @@ export type CellSnapshot = {
   meta: Record<string, [number, string]>;
   tombs: { id: string; v: number; ts: number; author: string }[];
   files: any[];
+  pages: CellPage[];
 };
 
 const url = (docId: string, path: string, page: string): string | null => {
@@ -52,6 +57,7 @@ export const cellSnapshot = async (docId: string, page: string): Promise<CellSna
     meta: j.meta ?? {},
     tombs: Array.isArray(j.tombs) ? j.tombs : [],
     files: Array.isArray(j.files) ? j.files : [],
+    pages: Array.isArray(j.pages) ? j.pages : [],
   };
 };
 
@@ -98,6 +104,7 @@ export const cellSubscribe = (
             meta: m.meta ?? {},
             tombs: Array.isArray(m.tombs) ? m.tombs : [],
             files: Array.isArray(m.files) ? m.files : [],
+            pages: Array.isArray(m.pages) ? m.pages : [],
           });
         }
       } catch {}
