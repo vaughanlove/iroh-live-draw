@@ -18,6 +18,7 @@ import {
   sealFile,
   selfTest,
 } from './crypto.js'
+import { cellPush, cellSnapshot, cellSubscribe } from './cell.js'
 
 async function copyText(t: string) {
   try {
@@ -837,6 +838,30 @@ export default function App() {
     try {
       if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return false
       if (!force && (apiRef.current?.getSceneElements() ?? []).length > 0) return false
+      // Cell first (no iroh needed): plain HTTPS snapshot from the celld
+      // fleet. Same envelope/claims wire format as the keeper path, so the
+      // ingest below is shared. Falls through to gossip/QUIC on failure.
+      try {
+        const snap = await cellSnapshot(roomId, page)
+        if (snap && (snap.elements.length || snap.tombs.length)) {
+          if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return false
+          lastFetch.current = `cell els=${snap.elements.length} tombs=${snap.tombs.length}`
+          const files = await openIncomingFiles(roomId, snap.files)
+          if (files.length) ingestFiles(files)
+          const els = await openEls(roomId, snap.elements)
+          if (!els.length && !snap.tombs.length) return false
+          remote.current = true
+          try {
+            if (ingestTombs(snap.tombs)) { /* enforced below */ }
+            if (els.length) queueRemote(els, snap.meta, false)
+            enforceTombs()
+          } finally {
+            remote.current = false
+          }
+          setStatus('restored from cell')
+          return true
+        }
+      } catch {}
       // NOTE: deliberately no api guard — queueRemote holds the data and
       // flushPending waits for mount. Requiring api here drops rejoins
       // whose fetch beats Excalidraw's mount.
@@ -1509,6 +1534,36 @@ export default function App() {
     } catch (e) {
       setSaveInfo(`save FAILED: ${String(e).slice(0, 80)}`)
     }
+    scheduleCellPush(roomId, pg)
+  }
+
+  // Cell push (debounced trailing 2.5s): sealed live scene + claims to the
+  // celld fleet. Fire-and-forget — gossip + localStorage stay the safety net
+  // until this path is proven. No iroh involved.
+  const cellPushTimers = useRef(new Map<string, number>())
+  const pushCellNow = async (roomId: string, pg: string) => {
+    try {
+      const g = gatherPage(roomId, pg)
+      const sels = await sealEls(roomId, g.els)
+      const sfiles = await sealOutgoingFiles(roomId, g.files)
+      const fmap: Record<string, any> = {}
+      for (const f of sfiles) if (f?.id) fmap[f.id] = f
+      cellPush(roomId, pg, { elements: sels, meta: g.meta, tombs: g.tombs, files: fmap })
+    } catch {}
+  }
+  const scheduleCellPush = (roomId: string, pg: string) => {
+    try {
+      const k = `${roomId}/${pg}`
+      const prev = cellPushTimers.current.get(k)
+      if (prev) window.clearTimeout(prev)
+      cellPushTimers.current.set(
+        k,
+        window.setTimeout(() => {
+          cellPushTimers.current.delete(k)
+          void pushCellNow(roomId, pg)
+        }, 2500),
+      )
+    } catch {}
   }
 
   // Restore a doc's snapshot into the canvas. Safe to call before the
@@ -1867,6 +1922,33 @@ export default function App() {
     }, 3000)
     return () => clearInterval(t)
   }, [])
+
+  // Cell live merges: WS fan-out from the celld fleet, ingested through the
+  // same decrypt-then-merge path as gossip 'p'. No iroh involved.
+  useEffect(() => {
+    if (!activeId) return
+    const roomId = activeId
+    return cellSubscribe(roomId, (pg, snap) => {
+      if (roomId !== activeRef.current) return
+      void (async () => {
+        try {
+          const els = await openEls(roomId, snap.elements)
+          const files = await openIncomingFiles(roomId, snap.files)
+          if (pg === (activePageRef.current ?? 'main')) {
+            if (files.length) ingestFiles(files)
+            if (ingestTombs(snap.tombs ?? [])) { /* enforced below */ }
+            if (els.length) queueRemote(els, snap.meta, false)
+            remote.current = true
+            try { enforceTombs() } finally { remote.current = false }
+          } else if (els.length || Array.isArray(snap.tombs)) {
+            mergePageSnapshot(roomId, pg, els, snap.meta, snap.tombs ?? [], files)
+          } else if (files.length) {
+            mergePageSnapshot(roomId, pg, [], undefined, [], files)
+          }
+        } catch {}
+      })()
+    })
+  }, [activeId])
 
   // DEBUG-only console hook for the e2e sandbox (draw/add/delete/verify).
   useEffect(() => {
