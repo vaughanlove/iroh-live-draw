@@ -708,9 +708,21 @@ export default function App() {
     const out: any[] = []
     for (const el of elements) {
       if (isEnvelope(el)) {
-        if (!key) continue
+        // Sealed content without a key is undisplayable. Count it loudly:
+        // this is the "cursor arrives, strokes don't" signature — the joiner
+        // pasted a bare ticket instead of opening the full share link (&k=).
+        if (!key) {
+          stats.current.poison++
+          stats.current.lastErr = 'envelope without key (need full share link)'
+          if (roomId === activeRef.current) setStatus('missing data key — open the full share link (with &k=), not the bare ticket')
+          continue
+        }
         const pt = await openElement(key, el)
         if (pt) out.push(pt)
+        else {
+          stats.current.poison++
+          stats.current.lastErr = 'envelope failed to open (wrong key?)'
+        }
       } else out.push(el)
     }
     return out
@@ -1953,6 +1965,7 @@ export default function App() {
         pushCollaborators()
       },
       meta: () => [...metaActive.current.entries()].map(([id, e]) => ({ id, ...e })),
+      hasKey: () => !!docKey(activeRef.current ?? ''),
       mesh: () => {
         const els = apiRef.current?.getSceneElements() ?? []
         return (els as any[]).map((el) => {
