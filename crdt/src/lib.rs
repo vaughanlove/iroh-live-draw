@@ -258,3 +258,67 @@ mod tests {
         assert_eq!(back.meta["a"], (7, "bob".to_string()));
     }
 }
+
+/// Raw wasm ABI for hosts without wasm-bindgen glue (celld `import .. from
+/// "./crdt.wasm"` gives the compiled module directly).
+///
+/// Protocol: `crdt_alloc(len) -> ptr` to reserve input space, write the
+/// UTF-8 JSON `{state, push}` at `ptr`, call `crdt_merge(ptr, len) -> packed`
+/// where `packed = out_ptr | (out_len << 32)`, read `out_len` bytes at
+/// `out_ptr` (UTF-8 JSON snapshot), then `crdt_free(out_ptr, out_len)`.
+/// All pointers are wasm32 linear-memory offsets.
+#[cfg(target_arch = "wasm32")]
+mod wasm_abi {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct MergeIn {
+        #[serde(default)]
+        state: PageState,
+        #[serde(default)]
+        push: Push,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn crdt_alloc(len: usize) -> *mut u8 {
+        let mut buf = Vec::<u8>::with_capacity(len);
+        let ptr = buf.as_mut_ptr();
+        std::mem::forget(buf);
+        ptr
+    }
+
+    #[no_mangle]
+    pub extern "C" fn crdt_free(ptr: *mut u8, len: usize) {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, len, len);
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn crdt_merge(in_ptr: *const u8, in_len: usize) -> u64 {
+        let fail = |msg: &str| -> u64 {
+            let out = serde_json::json!({ "error": msg }).to_string().into_bytes();
+            emit(out)
+        };
+        if in_ptr.is_null() {
+            return fail("null input");
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(in_ptr, in_len) };
+        let input: MergeIn = match serde_json::from_slice(bytes) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("bad input: {e}")),
+        };
+        let mut state = input.state;
+        state.merge(&input.push);
+        emit(serde_json::to_vec(&state.snapshot()).unwrap_or_default())
+    }
+
+    fn emit(out: Vec<u8>) -> u64 {
+        let len = out.len() as u64;
+        let ptr = out.leak().as_ptr() as u64;
+        ptr | (len << 32)
+    }
+}

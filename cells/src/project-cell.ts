@@ -1,8 +1,72 @@
 // One cell per project: the honest version of keeper/.
 // State: envelopes + cleartext CRDT claims (id, v, ts, author) + tombstones.
 // The cell merges opaquely like the keeper does today — it never sees the
-// data key, never decrypts. LWW compare is (v, ts, author), tombstone wins
-// ties exactly as keeper PageState + App.tsx do.
+// data key, never decrypts. Merge runs in the draw-crdt Rust wasm build
+// (same source as native keeper/tests); the JS mirror below is fallback
+// only, for a wasm that fails to instantiate.
+import crdtModule from './crdt.wasm';
+
+let crdt: {
+  memory: WebAssembly.Memory;
+  crdt_alloc: (len: number) => number;
+  crdt_free: (ptr: number, len: number) => void;
+  crdt_merge: (ptr: number, len: number) => bigint;
+} | null = null;
+try {
+  const inst = new WebAssembly.Instance(crdtModule, {});
+  crdt = inst.exports as any;
+} catch (e) {
+  console.warn('[cell] crdt wasm unavailable, JS fallback:', e);
+}
+
+const TE = new TextEncoder();
+const TD = new TextDecoder();
+
+const wasmMerge = (s: any, push: any): any | null => {
+  if (!crdt) return null;
+  try {
+    const input = TE.encode(JSON.stringify({ state: toWasmState(s), push }));
+    const inPtr = crdt.crdt_alloc(input.length);
+    new Uint8Array(crdt.memory.buffer).set(input, inPtr);
+    const packed = crdt.crdt_merge(inPtr, input.length);
+    // packed = out_ptr | (out_len << 32); BigInt when i64 is involved.
+    const p = typeof packed === 'bigint' ? packed : BigInt(packed as any);
+    const outPtr = Number(p & 0xffffffffn);
+    const outLen = Number(p >> 32n);
+    const out = TD.decode(new Uint8Array(crdt.memory.buffer).slice(outPtr, outPtr + outLen));
+    crdt.crdt_free(outPtr, outLen);
+    const snap = JSON.parse(out);
+    if (snap?.error) throw new Error(snap.error);
+    return fromWasmSnapshot(snap);
+  } catch (e) {
+    console.warn('[cell] wasm merge failed, JS fallback:', e);
+    return null;
+  }
+};
+
+// Rust PageState shape: meta/tombs as {id: {v, ts, author}},
+// files as {id: value}. JS cell keeps meta as {id: [ts, author]} alongside.
+const toWasmState = (s: any) => {
+  const meta: Record<string, any> = {};
+  for (const [id, m] of Object.entries(s.meta ?? {})) {
+    const a = m as any;
+    if (Array.isArray(a)) {
+      // Stored JS claim is [ts, author]; version rides on the element.
+      const v = (s.elements as any)?.[id]?.version ?? 0;
+      meta[id] = { v, ts: a[0] ?? 0, author: a[1] ?? '' };
+    } else meta[id] = a;
+  }
+  return { elements: s.elements ?? {}, meta, tombs: s.tombs ?? {}, files: s.files ?? {} };
+};
+
+const fromWasmSnapshot = (snap: any) => ({
+  elements: Object.fromEntries((snap.elements ?? []).map((el: any) => [el?.id, el])),
+  meta: Object.fromEntries(
+    Object.entries(snap.meta ?? {}).map(([id, v]: any) => [id, Array.isArray(v) ? v : [v.ts ?? 0, v.author ?? '']]),
+  ),
+  tombs: Object.fromEntries((snap.tombs ?? []).map((t: any) => [t.id, { v: t.v ?? 0, ts: t.ts ?? 0, author: t.author ?? '' }])),
+  files: Object.fromEntries((snap.files ?? []).map((f: any) => [f?.id ?? Math.random(), f])),
+});
 export class ProjectCell {
   state: any;
   constructor(state: any) {
@@ -49,7 +113,21 @@ export class ProjectCell {
 
   // Merge a push: envelopes in, merged snapshot out. Same rules as keeper
   // ingest_elements/ingest_tombs + evict: tomb-condemned elements stay dead.
+  // Rust wasm first (single source of truth), JS mirror as fallback.
   merge(s: any, push: any) {
+    const files = Array.isArray(push.files)
+      ? Object.fromEntries(push.files.filter((f: any) => f?.id).map((f: any) => [f.id, f]))
+      : (push.files ?? {});
+    const norm = { ...push, files };
+    const w = wasmMerge(s, norm);
+    if (w) {
+      // wasm returns map-shaped state; convert files back to cell shape.
+      return { elements: w.elements, meta: w.meta, tombs: w.tombs, files: w.files };
+    }
+    return this.mergeJs(s, norm);
+  }
+
+  mergeJs(s: any, push: any) {
     for (const t of push.tombs ?? []) {
       if (!t?.id) continue;
       const cand = { v: t.v ?? 0, ts: t.ts ?? 0, author: t.author ?? '' };
