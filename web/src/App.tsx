@@ -133,6 +133,53 @@ const browserSecretHex = (): string => {
   return base.trim()
 }
 
+// Same-browser second tabs would share the stored id, and the relay then
+// evicts the older connection ("Another endpoint connected with the same
+// endpoint id. No more messages will be received") — one tab goes deaf
+// while the other still sends: one-way cursors, one-way strokes. So the
+// FIRST tab wins the stored id via a heartbeat lock; later tabs (and
+// `?fresh=1`) take an ephemeral key instead. Ephemeral tabs look like
+// strangers to ownership/firewall rules; the status stamp says so.
+const TAB_ID = (() => {
+  try {
+    let t = sessionStorage.getItem('draw.tab')
+    if (!t) {
+      t = randomHex(8)
+      sessionStorage.setItem('draw.tab', t)
+    }
+    return t
+  } catch {
+    return randomHex(8)
+  }
+})()
+const ID_LOCK = 'draw.idlock'
+const claimIdentity = (): { hex: string; ephemeral: boolean } => {
+  try {
+    if (new URLSearchParams(location.search).has('fresh')) return { hex: randomHex(32), ephemeral: true }
+  } catch {}
+  let seen: any = null
+  try {
+    seen = JSON.parse(localStorage.getItem(ID_LOCK) ?? 'null')
+  } catch {}
+  if (seen && typeof seen.tab === 'string' && seen.tab !== TAB_ID && Date.now() - (seen.at ?? 0) < 6000) {
+    return { hex: randomHex(32), ephemeral: true } // sibling tab owns our stored id
+  }
+  try {
+    localStorage.setItem(ID_LOCK, JSON.stringify({ tab: TAB_ID, at: Date.now() }))
+  } catch {}
+  return { hex: browserSecretHex(), ephemeral: false }
+}
+const heartbeatIdentity = (): void => {
+  try {
+    let seen: any = null
+    try {
+      seen = JSON.parse(localStorage.getItem(ID_LOCK) ?? 'null')
+    } catch {}
+    if (seen && typeof seen.tab === 'string' && seen.tab !== TAB_ID && Date.now() - (seen.at ?? 0) < 6000) return
+    localStorage.setItem(ID_LOCK, JSON.stringify({ tab: TAB_ID, at: Date.now() }))
+  } catch {}
+}
+
 const loadDocs = (): DocMeta[] => {
   let docs: DocMeta[] = []
   try { docs = JSON.parse(localStorage.getItem(LS_DOCS) ?? '[]') } catch { return [] }
@@ -1850,6 +1897,7 @@ export default function App() {
   }
 
   // boot: stable identity, then room from share link if present
+  const heartbeatCleanup = useRef<(() => void) | null>(null)
   useEffect(() => {
     let dead = false
     void selfTest().then((ok) => {
@@ -1858,16 +1906,25 @@ export default function App() {
     ;(async () => {
       try {
         const DN: any = DrawNode
+        const { hex, ephemeral } = claimIdentity()
         const node = DN.spawn_with_key
-          ? await DN.spawn_with_key(browserSecretHex(), RELAY_URL)
+          ? await DN.spawn_with_key(hex, RELAY_URL)
           : await DN.spawn()
         if (dead) return
+        if (!ephemeral) {
+          const beat = window.setInterval(heartbeatIdentity, 3000)
+          heartbeatCleanup.current = () => window.clearInterval(beat)
+        }
         nodeRef.current = node
         const myId = node.endpoint_id() as string
         me.current = myId
         nick.current = 'peer-' + myId.slice(0, 6)
         setId(myId)
-        setStatus('ready — create or join a doc')
+        setStatus(
+          ephemeral
+            ? 'second tab: ephemeral identity — cursors + strokes work, ownership sees you as new'
+            : 'ready — create or join a doc',
+        )
         const ticket = new URLSearchParams(location.hash.slice(1)).get('t')
         if (ticket) {
           setStatus('joining…')
@@ -1898,7 +1955,12 @@ export default function App() {
         if (!dead) setStatus(`init failed: ${e}`)
       }
     })()
-    return () => { dead = true }
+    return () => {
+      dead = true
+      try {
+        heartbeatCleanup.current?.()
+      } catch {}
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
