@@ -1,0 +1,9 @@
+{
+  "name": "draw-cells",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [{ "name": "PROJECT", "class_name": "ProjectCell" }]
+  },
+  "assets": { "directory": "./public", "run_worker_first": ["/p/*"] }
+}

@@ -18,6 +18,8 @@ import {
   sealFile,
   selfTest,
 } from './crypto.js'
+import { cellPush, cellSnapshot, cellSubscribe } from './cell.js'
+import { attachPeerOverlay } from './peers.js'
 
 async function copyText(t: string) {
   try {
@@ -187,39 +189,13 @@ const saveHighlights = (docId: string, h: Highlight[]) => {
 const DEBUG =
   (import.meta as any).env?.VITE_DEBUG === '1' ||
   new URLSearchParams(location.search).has('debug')
-// Custom relay (all mesh traffic) + keeper (always-on watch peer).
-// Empty = n0 defaults / no keeper. Both also accept `?relay=` / `?keeper=`
-// query overrides (handy for tests and for pointing a build at private infra
-// without rebuilding).
+// Mesh relay (ephemeral gossip: strokes-in-flight, cursors, presence).
+// Client-side iroh through the Railway relay; the mesh never touches
+// Cloudflare and holds nothing durable. `?relay=` overrides per-boot.
 const qs = new URLSearchParams(location.search)
 const RELAY_URL = (qs.get('relay') ?? (import.meta as any).env?.VITE_RELAY_URL ?? '').trim() || undefined
-const KEEPER_URL = (qs.get('keeper') ?? (import.meta as any).env?.VITE_KEEPER_URL ?? '').trim().replace(/\/$/, '') || undefined
-const KEEPER_TOKEN = (
-  (import.meta as any).env?.VITE_KEEPER_TOKEN ??
-  (import.meta as any).env?.VITE_KEEPER_SECRET ??
-  ''
-).trim() || undefined
-
-// Register a doc's ticket with the keeper so it joins as a watch peer.
-// Fire-and-forget: keeper down just means no cache until it's back.
-// The keeper's endpoint id comes back in the response and is stored for
-// direct snapshot fetches (no gossip mesh needed for those).
-const LS_KEEPER = 'draw.keeper'
-const registerWithKeeper = (ticket: string) => {
-  if (!KEEPER_URL || !ticket) return
-  try {
-    fetch(`${KEEPER_URL}/watch`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(KEEPER_TOKEN ? { 'x-keeper-token': KEEPER_TOKEN } : {}),
-      },
-      body: JSON.stringify({ ticket }),
-    }).then((r) => r.json()).then((j) => {
-      if (j?.keeper) { try { localStorage.setItem(LS_KEEPER, String(j.keeper)) } catch {} }
-    }).catch(() => {})
-  } catch {}
-}
+// NOTE: VITE_KEEPER_URL / ?keeper= now address the celld fleet (durable
+// truth); see cell.ts. The keeper watch peer is retired.
 
 import { useState as useRolodexState, useRef as useRolodexRef } from 'react'
 
@@ -732,9 +708,21 @@ export default function App() {
     const out: any[] = []
     for (const el of elements) {
       if (isEnvelope(el)) {
-        if (!key) continue
+        // Sealed content without a key is undisplayable. Count it loudly:
+        // this is the "cursor arrives, strokes don't" signature — the joiner
+        // pasted a bare ticket instead of opening the full share link (&k=).
+        if (!key) {
+          stats.current.poison++
+          stats.current.lastErr = 'envelope without key (need full share link)'
+          if (roomId === activeRef.current) setStatus('missing data key — open the full share link (with &k=), not the bare ticket')
+          continue
+        }
         const pt = await openElement(key, el)
         if (pt) out.push(pt)
+        else {
+          stats.current.poison++
+          stats.current.lastErr = 'envelope failed to open (wrong key?)'
+        }
       } else out.push(el)
     }
     return out
@@ -830,45 +818,48 @@ export default function App() {
 
   // Snapshots can vanish into a half-built mesh (late-joiner broadcast
   // stall): if our scene is still empty seconds after requesting, ask
-  // again. Last resort is a direct QUIC fetch from the keeper, which needs
-  // no gossip mesh at all. All bounded — each step fires only if we're
-  // still on the same doc+page with an empty canvas.
+  // again. The cell snapshot needs no mesh at all. All bounded — each step
+  // fires only if we're still on the same doc+page with an empty canvas.
   const fetchFromKeeper = async (roomId: string, page: string, force = false): Promise<boolean> => {
     try {
       if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return false
       if (!force && (apiRef.current?.getSceneElements() ?? []).length > 0) return false
-      // NOTE: deliberately no api guard — queueRemote holds the data and
-      // flushPending waits for mount. Requiring api here drops rejoins
-      // whose fetch beats Excalidraw's mount.
-      const node = nodeRef.current
-      const keeperId = localStorage.getItem(LS_KEEPER)
-      const ticket = docsRef.current.find((d) => d.id === roomId)?.ticket
-      // Keeper shares our relay setup in every deployment that matters, so
-      // our own home relay is a sound fallback when none is configured.
-      const relay = RELAY_URL ?? node?.relay_url?.()
-      if (!node?.fetch_snapshot || !keeperId || !relay || !ticket) {
-        lastFetch.current = `skipped:${!node?.fetch_snapshot ? ' nofn' : ''}${!keeperId ? ' noid' : ''}${!relay ? ' norelay' : ''}${!ticket ? ' noticket' : ''}`
-        return false
-      }
-      const json = await node.fetch_snapshot(keeperId, relay, ticket, page)
-      if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
-      const res = JSON.parse(json)
-      lastFetch.current = `els=${res.elements?.length ?? '?'} tombs=${res.tombs?.length ?? '?'}`
-      const files = await openIncomingFiles(roomId, res.files)
-      if (files.length) ingestFiles(files)
-      const els = await openEls(roomId, Array.isArray(res.elements) ? res.elements : [])
-      const tombs = Array.isArray(res.tombs) ? res.tombs : []
-      if (!els.length && !tombs.length) return false
-      remote.current = true
+      // Cell (no iroh needed): plain HTTPS snapshot from the celld fleet.
+      // Same envelope/claims wire format as gossip, so the ingest below is
+      // shared. Falls through to gossip snap-req retries on failure.
       try {
-        if (ingestTombs(tombs)) { /* enforced below */ }
-        if (els.length) queueRemote(els, res.meta, false)
-        enforceTombs()
-      } finally {
-        remote.current = false
-      }
-      setStatus('restored from keeper')
-      return true
+        const snap = await cellSnapshot(roomId, page)
+        if (snap && (snap.elements.length || snap.tombs.length || (snap.pages?.length ?? 0))) {
+          if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return false
+          lastFetch.current = `cell els=${snap.elements.length} tombs=${snap.tombs.length}`
+          // Adopt boards we never heard about over gossip (late join on an
+          // old board while viewing 'main'). Roster lives in the cell now.
+          if (Array.isArray(snap.pages) && snap.pages.length) mergePages(roomId, snap.pages)
+          const files = await openIncomingFiles(roomId, snap.files)
+          if (files.length) ingestFiles(files)
+          const els = await openEls(roomId, snap.elements)
+          if (!els.length && !snap.tombs.length) {
+            // Nothing for this page, but the roster may name the live board:
+            // follow it (once per doc) instead of camping on empty 'main'.
+            followLiveBoard(roomId)
+            return false
+          }
+          remote.current = true
+          try {
+            if (ingestTombs(snap.tombs)) { /* enforced below */ }
+            if (els.length) queueRemote(els, snap.meta, false)
+            enforceTombs()
+          } finally {
+            remote.current = false
+          }
+          setStatus('restored from cell')
+          return true
+        }
+      } catch {}
+      // Cell missed (or no cell configured): fall through to gossip
+      // snap-req retries. The keeper QUIC path is retired — the mesh holds
+      // nothing durable, the cell holds everything.
+      return false
     } catch (e) {
       fetchErr.current = String(e).slice(0, 160)
       return false
@@ -882,17 +873,16 @@ export default function App() {
       window.setTimeout(() => requestSnap(roomId, page, 1), 6000)
       return
     }
-    // Gossip retries didn't fill us: go direct to the keeper, which needs
-    // no mesh at all. Keep trying a few times — relay settle, keeper id
-    // arrival, and api mount all race boot.
+    // Gossip retries didn't fill us: go to the cell, which needs no mesh
+    // at all. Keep trying a few times — cell deploy, api mount all race boot.
     fetchFromKeeper(roomId, page, true).then((ok) => {
       if (!ok && attempt < 4) window.setTimeout(() => requestSnap(roomId, page, attempt + 1), 8000)
     })
   }
 
-  // Keeper pull independent of scene emptiness: merge-only, so it can run
+  // Cell pull independent of scene emptiness: merge-only, so it can run
   // on every join even with a stale-but-nonempty canvas. Retries until it
-  // goes through (relay/keeper-id/api all race boot).
+  // goes through.
   const requestKeeper = (roomId: string, page: string, attempt = 0) => {
     if (roomId !== activeRef.current || page !== (activePageRef.current ?? 'main')) return
     if (attempt > 4) return
@@ -945,6 +935,17 @@ export default function App() {
     } catch (e) { setStatus(`firewall failed: ${e}`) }
   }
 
+  // ---- Sync split: DURABLE vs EPHEMERAL ---------------------------------
+  // DURABLE (must survive a dead node): elements + claims + tombstones +
+  // files. Two writers: gossip 'p'/'snap' (live peers, merge-only) and the
+  // cell (debounced push, snapshot fetch, WS fan-out). Both carry the same
+  // sealed envelopes + cleartext claims; the Rust draw-crdt merge is the
+  // single judge of what wins.
+  // EPHEMERAL (latest-wins, loss is fine): cursor positions, presence.
+  // Mesh-only ('cursor' gossip, set_current_doc presence), rendered from
+  // board.peers on a separate overlay canvas. These MUST NOT enter rev,
+  // onChange, localStorage snapshots, or cell pushes — durability gating
+  // on throwaway data is pure latency tax.
   const sendMsg = (obj: any) => {
     const ch = activeCh()
     if (!ch) return
@@ -1509,6 +1510,44 @@ export default function App() {
     } catch (e) {
       setSaveInfo(`save FAILED: ${String(e).slice(0, 80)}`)
     }
+    scheduleCellPush(roomId, pg)
+  }
+
+  // Cell push (debounced trailing 2.5s): sealed live scene + claims to the
+  // celld fleet. Fire-and-forget — gossip + localStorage stay the safety net
+  // until this path is proven. No iroh involved.
+  const cellPushTimers = useRef(new Map<string, number>())
+  const pushCellNow = async (roomId: string, pg: string) => {
+    try {
+      const g = gatherPage(roomId, pg)
+      const sels = await sealEls(roomId, g.els)
+      const sfiles = await sealOutgoingFiles(roomId, g.files)
+      const fmap: Record<string, any> = {}
+      for (const f of sfiles) if (f?.id) fmap[f.id] = f
+      const doc = docsRef.current.find((d) => d.id === roomId)
+      cellPush(roomId, pg, {
+        elements: sels,
+        meta: g.meta,
+        tombs: g.tombs,
+        files: fmap,
+        pages: (doc?.pages ?? []).map((p) => ({ id: p.id, name: p.name, createdAt: p.createdAt, updatedAt: p.updatedAt })),
+        pageName: doc?.pages?.find((p) => p.id === pg)?.name ?? pg,
+      })
+    } catch {}
+  }
+  const scheduleCellPush = (roomId: string, pg: string) => {
+    try {
+      const k = `${roomId}/${pg}`
+      const prev = cellPushTimers.current.get(k)
+      if (prev) window.clearTimeout(prev)
+      cellPushTimers.current.set(
+        k,
+        window.setTimeout(() => {
+          cellPushTimers.current.delete(k)
+          void pushCellNow(roomId, pg)
+        }, 2500),
+      )
+    } catch {}
   }
 
   // Restore a doc's snapshot into the canvas. Safe to call before the
@@ -1605,6 +1644,28 @@ export default function App() {
     if (doc) sendMsg({ t: 'pages', pages: doc.pages })
   }
 
+  // Late-join follow: our page is empty but the adopted roster names other
+  // boards (old board, we landed on 'main'). Jump once per doc to the most
+  // recently touched board instead of showing an empty canvas. The switch
+  // itself triggers a snapshot fetch for that page, so this terminates.
+  const followedRef = useRef(new Set<string>())
+  const followLiveBoard = (roomId: string) => {
+    try {
+      if (followedRef.current.has(roomId)) return
+      if ((apiRef.current?.getSceneElements() ?? []).length > 0) return
+      const pg = activePageRef.current ?? 'main'
+      const raw = localStorage.getItem(snapKey(roomId, pg))
+      if (raw && raw !== '[]') return
+      const doc = docsRef.current.find((d) => d.id === roomId)
+      const others = (doc?.pages ?? []).filter((p) => p.id !== pg)
+      if (!others.length) return
+      followedRef.current.add(roomId)
+      others.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      setStatus(`following live board ${others[0].name}`)
+      switchPage(others[0].id)
+    } catch {}
+  }
+
   const switchDoc = (roomId: string) => {
     if (DEBUG) console.log(`[flow] switchDoc ${roomId.slice(0,6)} t=${Date.now() % 100000}`)
     // flush outgoing edits + persist outgoing canvas
@@ -1645,16 +1706,13 @@ export default function App() {
     setStatus('connected — draw!')
     refreshOwnerLive()
     requestSnap(roomId, pg)
-    // Every join pulls the keeper's latest for this page and merges it —
+    // Every join pulls the cell's latest for this page and merges it —
     // reconnect, room switch, and refresh are all the same event: someone
     // joining a stream. Merge (never replace) so unsynced local edits
-    // survive alongside the keeper's truth. Keeper pull runs regardless of
+    // survive alongside the cell's truth. Cell pull runs regardless of
     // scene emptiness (unlike the gossip snap path above).
     requestKeeper(roomId, pg, 0)
     window.setTimeout(() => healFromSnapshot(roomId, pg), 4000)
-    // The selected document wakes the keeper.
-    const sel = docsRef.current.find((d) => d.id === roomId)
-    if (sel?.ticket) registerWithKeeper(sel.ticket)
   }
 
   const switchPage = (pageId: string) => {
@@ -1742,7 +1800,6 @@ export default function App() {
     else docs.push(entry)
     setDocsBoth(docs)
     try { ch.sender.set_current_doc?.(presenceDoc()) } catch {}
-    registerWithKeeper(ticketStr)
     return roomId
   }
 
@@ -1774,18 +1831,22 @@ export default function App() {
     setStatus('new project created — share link copied')
   }
 
+  // EPHEMERAL presence → render-only peers. Cursor dots ride the mesh and
+  // land in board.peers (overlay canvas); they never enter rev, onChange,
+  // snapshots, or the cell. Stale entries (>3s) are pruned at write + paint.
   const pushCollaborators = () => {
-    const a = apiRef.current
-    if (!a) return
-    const map = new Map()
+    const board = boardRef.current
+    if (!board) return
+    const peers: Record<string, { x: number; y: number; nick: string; at: number }> = {}
     for (const [from, c] of Object.entries(cursors.current)) {
-      map.set(from, {
-        pointer: { x: c.x, y: c.y, tool: 'pointer' },
-        button: 'up',
-        username: dispNick(from, onlineRef.current[from] ?? peersRef.current[from]?.nick ?? from.slice(0, 6)),
-      })
+      peers[from] = {
+        x: c.x,
+        y: c.y,
+        nick: dispNick(from, onlineRef.current[from] ?? peersRef.current[from]?.nick ?? from.slice(0, 6)),
+        at: c.at,
+      }
     }
-    a.updateScene({ collaborators: map as any })
+    board.setPeers(peers)
   }
 
   // boot: stable identity, then room from share link if present
@@ -1868,6 +1929,34 @@ export default function App() {
     return () => clearInterval(t)
   }, [])
 
+  // Cell live merges: WS fan-out from the celld fleet, ingested through the
+  // same decrypt-then-merge path as gossip 'p'. No iroh involved.
+  useEffect(() => {
+    if (!activeId) return
+    const roomId = activeId
+    return cellSubscribe(roomId, (pg, snap) => {
+      if (roomId !== activeRef.current) return
+      void (async () => {
+        try {
+          if (Array.isArray(snap.pages) && snap.pages.length) mergePages(roomId, snap.pages)
+          const els = await openEls(roomId, snap.elements)
+          const files = await openIncomingFiles(roomId, snap.files)
+          if (pg === (activePageRef.current ?? 'main')) {
+            if (files.length) ingestFiles(files)
+            if (ingestTombs(snap.tombs ?? [])) { /* enforced below */ }
+            if (els.length) queueRemote(els, snap.meta, false)
+            remote.current = true
+            try { enforceTombs() } finally { remote.current = false }
+          } else if (els.length || Array.isArray(snap.tombs)) {
+            mergePageSnapshot(roomId, pg, els, snap.meta, snap.tombs ?? [], files)
+          } else if (files.length) {
+            mergePageSnapshot(roomId, pg, [], undefined, [], files)
+          }
+        } catch {}
+      })()
+    })
+  }, [activeId])
+
   // DEBUG-only console hook for the e2e sandbox (draw/add/delete/verify).
   useEffect(() => {
     if (!DEBUG) return
@@ -1915,6 +2004,7 @@ export default function App() {
         pushCollaborators()
       },
       meta: () => [...metaActive.current.entries()].map(([id, e]) => ({ id, ...e })),
+      hasKey: () => !!docKey(activeRef.current ?? ''),
       mesh: () => {
         const els = apiRef.current?.getSceneElements() ?? []
         return (els as any[]).map((el) => {
@@ -2206,6 +2296,37 @@ export default function App() {
     }
   }
 
+  // EPHEMERAL cursor broadcast: throttled pointer position over the mesh.
+  // Best-effort datagram semantics — drops are fine, the next move replaces
+  // them. Never persisted, never merged, never sent to the cell.
+  // Window-level (capture): the pen overlay swallows canvas pointer events
+  // while armed, so a canvas handler only fires for pan/eraser. Presence
+  // must not depend on the active tool.
+  const cursorLastRef = useRef(0)
+  const sendCursor = (clientX: number, clientY: number) => {
+    try {
+      const now = Date.now()
+      if (now - cursorLastRef.current < 100) return
+      cursorLastRef.current = now
+      const board = boardRef.current
+      const canvas = canvasRef.current
+      if (!board || !canvas || !activeCh()) return
+      const r = canvas.getBoundingClientRect()
+      const c = board.camera
+      sendMsg({
+        t: 'cursor',
+        x: (clientX - r.left) / c.zoom - c.scrollX,
+        y: (clientY - r.top) / c.zoom - c.scrollY,
+        page: activePageRef.current ?? 'main',
+      })
+    } catch {}
+  }
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => sendCursor(e.clientX, e.clientY)
+    window.addEventListener('pointermove', onMove, { capture: true, passive: true })
+    return () => window.removeEventListener('pointermove', onMove, { capture: true } as any)
+  }, [])
+
   const onCanvasPointerMove = (e: React.PointerEvent) => {
     if (pointersRef.current.has(e.pointerId)) {
       pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
@@ -2299,12 +2420,17 @@ export default function App() {
   useEffect(() => {
     let dead = false
     let view: { destroy(): void; stats(): string; renderer: string } | null = null
+    let peers: { destroy(): void } | null = null
     ;(async () => {
       const canvas = canvasRef.current
       const board = boardRef.current
       if (!canvas || !board) return
       board.onChange = stableOnChange
       board.setViewportSize(canvas.clientWidth, canvas.clientHeight)
+      // Ephemeral overlay first: own canvas + loop, zero coupling to ink.
+      try {
+        if (canvas.parentElement) peers = attachPeerOverlay(canvas.parentElement, canvas, board)
+      } catch {}
       try {
         view = await createBoardView(canvas, board, meshProviderRef.current)
       } catch (err) {
@@ -2318,6 +2444,7 @@ export default function App() {
     return () => {
       dead = true
       view?.destroy()
+      peers?.destroy()
       if (viewRef.current === view) viewRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

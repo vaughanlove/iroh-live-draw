@@ -1,0 +1,9 @@
+{
+  "name": "draw-cells",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "celld dev",
+    "deploy": "celld deploy . --bucket \"$CELLD_BUCKET\" --endpoint \"$S3_ENDPOINT\" --region \"$AWS_REGION\""
+  }
+}

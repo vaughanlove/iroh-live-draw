@@ -29,6 +29,11 @@ export type ScenePatch = {
 export class Board {
   elements: El[] = []
   files = new Map<string, any>()
+  /// EPHEMERAL peer presence (cursor dots). Render-only: never bumps rev,
+  /// never fires onChange, never persists, never reaches the cell. Loss and
+  /// staleness are fine — the next cursor message replaces them. This is the
+  /// mesh path; the cell path owns everything durable.
+  peers = new Map<string, { x: number; y: number; nick: string; at: number }>()
   /// Camera TARGET: where input wants to be (pan/zoom/pinch write here,
   /// clamp enforces here). The renderer draws this directly — no spring,
   /// no momentum: 1:1 tracking only.
@@ -113,5 +118,18 @@ export class Board {
   setViewportSize(w: number, h: number) {
     this.camera.width = w
     this.camera.height = h
+  }
+
+  /// Render-only peer update. Deliberately outside updateScene: no rev bump
+  /// (that would force a full ink repaint per cursor move), no onChange
+  /// (cursors must never enter sync, snapshots, or the cell).
+  setPeers(peers: Record<string, { x: number; y: number; nick: string; at: number }>) {
+    this.peers.clear()
+    const now = Date.now()
+    for (const [id, p] of Object.entries(peers)) {
+      if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') continue
+      if (now - (p.at ?? 0) > 3000) continue
+      this.peers.set(id, p)
+    }
   }
 }
